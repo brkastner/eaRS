@@ -153,7 +153,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             websocket_port: 8765,
-            host: "localhost".to_string(),
+            host: "127.0.0.1".to_string(),
             listener_tokens: vec![],
             enable_listener_mode: false,
         }

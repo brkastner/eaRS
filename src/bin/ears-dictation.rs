@@ -15,6 +15,7 @@ use std::fs;
 use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -103,7 +104,7 @@ async fn main() -> Result<()> {
     write_pid_file()?;
 
     let running = Arc::new(Mutex::new(true));
-    let capturing = Arc::new(Mutex::new(true));
+    let capturing = Arc::new(Mutex::new(false));
     let dictation_state = Arc::new(Mutex::new(DictationState::Inactive));
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
@@ -114,6 +115,36 @@ async fn main() -> Result<()> {
         let _ = stop_tx.send(());
     })
     .context("Failed to set Ctrl+C handler")?;
+
+    // SIGUSR1 toggles capturing state for external hotkey integration
+    {
+        let sig_capturing = capturing.clone();
+        let sig_state = dictation_state.clone();
+        let sig_notif = config.dictation.notifications.clone();
+        #[cfg(feature = "hooks")]
+        let sig_hooks = config.dictation.hooks.clone();
+        tokio::spawn(async move {
+            let mut sigusr1 = signal(SignalKind::user_defined1())
+                .expect("failed to register SIGUSR1 handler");
+            loop {
+                sigusr1.recv().await;
+                let mut c = sig_capturing.lock().unwrap();
+                *c = !*c;
+                let is_active = *c;
+                eprintln!("SIGUSR1: audio capture {}", if is_active { "started" } else { "stopped" });
+                drop(c);
+                let event = if is_active {
+                    DictationState::Listening
+                } else {
+                    DictationState::Suspended
+                };
+                #[cfg(feature = "hooks")]
+                apply_state_change(&sig_state, event, &sig_notif, &sig_hooks);
+                #[cfg(not(feature = "hooks"))]
+                apply_state_change(&sig_state, event, &sig_notif);
+            }
+        });
+    }
 
     let hotkey_running = running.clone();
     let hotkey_capturing = capturing.clone();
@@ -402,11 +433,7 @@ fn handle_message(
             }
             "final" if is_capturing => {
                 if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        eprintln!("[TYPING FINAL] {}", text);
-                        keyboard.type_text(text)?;
-                        keyboard.press_key(SpecialKey::Space)?;
-                    }
+                    eprintln!("[FINAL] {}", text);
                 }
             }
             _ => {}

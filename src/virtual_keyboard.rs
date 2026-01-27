@@ -4,6 +4,9 @@
 //! - Linux (Wayland/X11): uinput kernel interface
 //! - Other platforms: enigo fallback
 
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 
 #[cfg(target_os = "linux")]
@@ -108,6 +111,7 @@ impl VirtualKeyboard for UInputKeyboard {
     fn type_text(&mut self, text: &str) -> Result<()> {
         for ch in text.chars() {
             self.type_char(ch)?;
+            thread::sleep(Duration::from_micros(500));
         }
         Ok(())
     }

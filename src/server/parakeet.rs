@@ -245,7 +245,7 @@ fn run_parakeet_session(
     let mut buffer_24k: Vec<f32> = Vec::new();
     let mut buffer_offset_24k: usize = 0;
     let mut total_samples_24k: usize = 0;
-    let mut previous_words: Vec<WordTimestamp> = Vec::new();
+    let mut emitted_words: Vec<WordTimestamp> = Vec::new();
 
     let mut vad_state = VadState::new(config.options.vad);
     let vad_timeout = config.options.vad_timeout;
@@ -361,22 +361,27 @@ fn run_parakeet_session(
             };
 
             match transcription {
-                Ok((text, words)) => {
-                    let new_words = words.clone();
-                    let common_prefix = common_prefix_len(&previous_words, &new_words);
-                    for word in new_words.iter().skip(common_prefix) {
+                Ok((_text, words)) => {
+                    let skip = suffix_prefix_overlap(&emitted_words, &words);
+
+                    for word in words.iter().skip(skip) {
                         sink.handle_message(WebSocketMessage::Word {
                             word: word.word.clone(),
                             start_time: word.start_time,
                             end_time: None,
                         });
+                        emitted_words.push(word.clone());
                     }
-                    previous_words = new_words.clone();
 
                     if stop_requested {
+                        let final_text = emitted_words
+                            .iter()
+                            .map(|w| w.word.clone())
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         sink.handle_message(WebSocketMessage::Final {
-                            text,
-                            words: new_words,
+                            text: final_text,
+                            words: emitted_words.clone(),
                         });
                         sink.close();
                         break;
@@ -397,15 +402,15 @@ fn run_parakeet_session(
         }
 
         if !received_audio && stop_requested {
-            if !previous_words.is_empty() {
-                let final_text = previous_words
+            if !emitted_words.is_empty() {
+                let final_text = emitted_words
                     .iter()
                     .map(|w| w.word.clone())
                     .collect::<Vec<_>>()
                     .join(" ");
                 sink.handle_message(WebSocketMessage::Final {
                     text: final_text,
-                    words: previous_words.clone(),
+                    words: emitted_words.clone(),
                 });
             }
             sink.close();
@@ -466,12 +471,32 @@ fn process_vad_frames(
     voice
 }
 
-fn common_prefix_len(a: &[WordTimestamp], b: &[WordTimestamp]) -> usize {
-    let mut idx = 0;
-    while idx < a.len() && idx < b.len() && a[idx].word == b[idx].word {
-        idx += 1;
+/// Strip trailing punctuation for comparison purposes.
+fn normalize_word(w: &str) -> String {
+    w.trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .to_lowercase()
+}
+
+/// Find the longest suffix of `emitted` that matches a prefix of `new_words`
+/// (case-insensitive, punctuation-normalized). Returns the number of words to
+/// skip from `new_words`.
+fn suffix_prefix_overlap(emitted: &[WordTimestamp], new_words: &[WordTimestamp]) -> usize {
+    // At most ~20 words could overlap (generous for 1s of speech)
+    let max_check = emitted.len().min(new_words.len()).min(20);
+
+    for len in (1..=max_check).rev() {
+        let emitted_suffix = &emitted[emitted.len() - len..];
+        let new_prefix = &new_words[..len];
+
+        if emitted_suffix
+            .iter()
+            .zip(new_prefix)
+            .all(|(a, b)| normalize_word(&a.word) == normalize_word(&b.word))
+        {
+            return len;
+        }
     }
-    idx
+    0
 }
 
 fn current_timestamp() -> f64 {
