@@ -134,14 +134,36 @@ impl SentenceCorrector {
         }
     }
 
-    /// Send a sentence to the LLM for correction
+    /// Send a chunk to the LLM for correction
     pub async fn correct_sentence(&self, sentence: &str) -> Result<String> {
         let prompt = format!(
-            r#"Fix any transcription errors, grammar issues, and punctuation in this dictated text. Output ONLY the corrected text, nothing else. Keep the meaning identical. If already correct, output unchanged.
+            r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Output ONLY the corrected text, nothing else.
 
 Text: {}"#,
             sentence
         );
+
+        self.call_ollama(&prompt).await
+    }
+
+    /// Final paragraph correction with more thorough cleanup
+    pub async fn correct_paragraph(&self, paragraph: &str) -> Result<String> {
+        let prompt = format!(
+            r#"Clean up this dictated paragraph. Fix:
+- Transcription errors (bath→batch, B4→before)
+- Grammar and punctuation
+- Remove filler words (uh, um)
+- Fix sentence boundaries
+Output ONLY the corrected text, preserving meaning.
+
+Text: {}"#,
+            paragraph
+        );
+
+        self.call_ollama(&prompt).await
+    }
+
+    async fn call_ollama(&self, prompt: &str) -> Result<String> {
 
         let request = OllamaRequest {
             model: &self.config.model,

@@ -320,7 +320,7 @@ async fn main() -> Result<()> {
                     SentenceCorrector::new(config)?
                 };
                 #[cfg(feature = "llm-correct")]
-                let mut sentence_buffer = SentenceBuffer::new();
+                let mut correction_buffer = CorrectionBuffer::new();
 
                 let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<WriterCommand>();
 
@@ -403,7 +403,7 @@ async fn main() -> Result<()> {
                                                         if let Err(e) = handle_word_with_correction(
                                                             word,
                                                             &mut keyboard,
-                                                            &mut sentence_buffer,
+                                                            &mut correction_buffer,
                                                             &mut corrector,
                                                         ).await {
                                                             eprintln!("[ERROR] {}", e);
@@ -475,39 +475,87 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Tracks typed words for sentence-level correction
+/// Tracks typed words for chunked + final correction
 #[cfg(feature = "llm-correct")]
-struct SentenceBuffer {
-    words: Vec<String>,
-    /// Total characters typed (including spaces)
-    char_count: usize,
+struct CorrectionBuffer {
+    /// Current chunk being accumulated
+    chunk_words: Vec<String>,
+    chunk_char_count: usize,
+    /// Full paragraph for final correction
+    paragraph_words: Vec<String>,
+    paragraph_char_count: usize,
+    /// Words per chunk before triggering correction
+    chunk_size: usize,
 }
 
 #[cfg(feature = "llm-correct")]
-impl SentenceBuffer {
+impl CorrectionBuffer {
     fn new() -> Self {
-        Self { words: Vec::new(), char_count: 0 }
+        Self {
+            chunk_words: Vec::new(),
+            chunk_char_count: 0,
+            paragraph_words: Vec::new(),
+            paragraph_char_count: 0,
+            chunk_size: 6,
+        }
     }
 
     fn add_word(&mut self, word: &str) {
-        if !self.words.is_empty() {
-            self.char_count += 1; // space
+        // Add to chunk
+        if !self.chunk_words.is_empty() {
+            self.chunk_char_count += 1; // space
         }
-        self.char_count += word.len();
-        self.words.push(word.to_string());
+        self.chunk_char_count += word.len();
+        self.chunk_words.push(word.to_string());
+
+        // Add to paragraph
+        if !self.paragraph_words.is_empty() {
+            self.paragraph_char_count += 1; // space
+        }
+        self.paragraph_char_count += word.len();
+        self.paragraph_words.push(word.to_string());
     }
 
-    fn take_sentence(&mut self) -> (String, usize) {
-        let sentence = self.words.join(" ");
-        let chars = self.char_count;
-        self.words.clear();
-        self.char_count = 0;
-        (sentence, chars)
+    fn take_chunk(&mut self) -> (String, usize) {
+        let text = self.chunk_words.join(" ");
+        let chars = self.chunk_char_count;
+        self.chunk_words.clear();
+        self.chunk_char_count = 0;
+        (text, chars)
     }
 
-    fn is_sentence_end(word: &str) -> bool {
+    fn take_paragraph(&mut self) -> (String, usize) {
+        let text = self.paragraph_words.join(" ");
+        let chars = self.paragraph_char_count;
+        self.paragraph_words.clear();
+        self.paragraph_char_count = 0;
+        self.chunk_words.clear();
+        self.chunk_char_count = 0;
+        (text, chars)
+    }
+
+    fn should_correct_chunk(&self, word: &str) -> bool {
+        let trimmed = word.trim();
+        // Correct on: sentence end, comma, semicolon, or chunk size reached
+        trimmed.ends_with('.')
+            || trimmed.ends_with('?')
+            || trimmed.ends_with('!')
+            || trimmed.ends_with(',')
+            || trimmed.ends_with(';')
+            || self.chunk_words.len() >= self.chunk_size
+    }
+
+    fn is_paragraph_end(word: &str) -> bool {
         let trimmed = word.trim();
         trimmed.ends_with('.') || trimmed.ends_with('?') || trimmed.ends_with('!')
+    }
+
+    fn chunk_len(&self) -> usize {
+        self.chunk_words.len()
+    }
+
+    fn paragraph_len(&self) -> usize {
+        self.paragraph_words.len()
     }
 }
 
@@ -543,12 +591,12 @@ fn handle_message(
     Ok(())
 }
 
-/// Handle a word with optional LLM correction
+/// Handle a word with chunked LLM correction
 #[cfg(feature = "llm-correct")]
 async fn handle_word_with_correction(
     word: &str,
     keyboard: &mut Box<dyn VirtualKeyboard>,
-    buffer: &mut SentenceBuffer,
+    buffer: &mut CorrectionBuffer,
     corrector: &mut SentenceCorrector,
 ) -> Result<()> {
     // Skip empty words and punctuation-only words
@@ -562,14 +610,14 @@ async fn handle_word_with_correction(
     keyboard.press_key(SpecialKey::Space)?;
     buffer.add_word(word);
 
-    // Check if this is end of sentence
-    if SentenceBuffer::is_sentence_end(word) && buffer.words.len() >= 2 {
-        let (original, char_count) = buffer.take_sentence();
+    // Check if we should correct this chunk
+    if buffer.should_correct_chunk(word) && buffer.chunk_len() >= 2 {
+        let (original, char_count) = buffer.take_chunk();
 
         // Get correction from LLM
         match corrector.correct_sentence(&original).await {
             Ok(corrected) if corrected != original => {
-                eprintln!("[CORRECTION] '{}' -> '{}'", original, corrected);
+                eprintln!("[CHUNK] '{}' -> '{}'", original, corrected);
 
                 // Backspace the original text (including trailing space)
                 for _ in 0..=char_count {
@@ -584,8 +632,45 @@ async fn handle_word_with_correction(
                 // No correction needed
             }
             Err(e) => {
-                eprintln!("[CORRECTION ERROR] {}", e);
+                eprintln!("[CHUNK ERROR] {}", e);
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Final paragraph correction when dictation pauses
+#[cfg(feature = "llm-correct")]
+async fn correct_final_paragraph(
+    keyboard: &mut Box<dyn VirtualKeyboard>,
+    buffer: &mut CorrectionBuffer,
+    corrector: &mut SentenceCorrector,
+) -> Result<()> {
+    if buffer.paragraph_len() < 2 {
+        return Ok(());
+    }
+
+    let (original, char_count) = buffer.take_paragraph();
+
+    match corrector.correct_paragraph(&original).await {
+        Ok(corrected) if corrected != original => {
+            eprintln!("[FINAL] '{}' -> '{}'", original, corrected);
+
+            // Backspace the entire paragraph (including trailing space)
+            for _ in 0..=char_count {
+                keyboard.press_key(SpecialKey::Backspace)?;
+            }
+
+            // Type corrected text
+            keyboard.type_text(&corrected)?;
+            keyboard.press_key(SpecialKey::Space)?;
+        }
+        Ok(_) => {
+            eprintln!("[FINAL] No changes needed");
+        }
+        Err(e) => {
+            eprintln!("[FINAL ERROR] {}", e);
         }
     }
 
