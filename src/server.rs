@@ -567,7 +567,7 @@ fn handle_client_message(
                 if chunk.is_empty() {
                     return Ok(());
                 }
-                eprintln!("[ears-server] forwarding {} samples to {:?}", chunk.len(), sess.engine());
+
                 sess.send_audio(chunk)?;
             }
         }

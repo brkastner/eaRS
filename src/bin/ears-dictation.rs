@@ -350,7 +350,7 @@ async fn main() -> Result<()> {
                             if let Some(message) = read.next().await {
                                 match message {
                                     Ok(Message::Text(text)) => {
-                                        eprintln!("[WS RECEIVED] {}", text);
+                                        // eprintln!("[WS RECEIVED] {}", text);
                                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                                             handle_message(&json, &mut keyboard, &capturing)?;
                                         } else {
@@ -425,7 +425,7 @@ fn handle_message(
             "word" if is_capturing => {
                 if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
                     if !word.is_empty() {
-                        eprintln!("[TYPING WORD] {}", word);
+                        // eprintln!("[TYPING WORD] {}", word);
                         keyboard.type_text(word)?;
                         keyboard.press_key(SpecialKey::Space)?;
                     }
