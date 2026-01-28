@@ -1,8 +1,7 @@
 [Unit]
 Description=eaRS speech-to-text server (remote access via Tailscale)
-After=graphical-session.target pipewire.service tailscaled.service
+After=graphical-session.target pipewire.service
 Wants=pipewire.service
-Requires=tailscaled.service
 
 [Service]
 Type=simple

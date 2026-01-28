@@ -1,7 +1,6 @@
 [Unit]
 Description=eaRS dictation client (connects to remote server with LLM correction)
-After=tailscaled.service
-Wants=tailscaled.service
+After=network-online.target
 
 [Service]
 Type=simple
