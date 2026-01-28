@@ -110,7 +110,10 @@ impl UInputKeyboard {
 impl VirtualKeyboard for UInputKeyboard {
     fn type_text(&mut self, text: &str) -> Result<()> {
         for ch in text.chars() {
-            self.type_char(ch)?;
+            // Skip unsupported characters (non-ASCII) instead of crashing
+            if let Err(_) = self.type_char(ch) {
+                continue;
+            }
             thread::sleep(Duration::from_micros(500));
         }
         Ok(())

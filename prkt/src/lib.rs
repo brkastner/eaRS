@@ -108,35 +108,35 @@ impl ParakeetModel {
         match device {
             Device::Cpu => {
                 eprintln!("Using CPU execution");
-                ort::init().commit()?;
+                ort::init().commit();
             }
             #[cfg(feature = "cuda")]
             Device::Cuda => {
                 eprintln!("Using CUDA execution");
                 ort::init()
                     .with_execution_providers([CUDAExecutionProvider::default().build()])
-                    .commit()?;
+                    .commit();
             }
             #[cfg(feature = "coreml")]
             Device::CoreML => {
                 eprintln!("Using CoreML execution");
                 ort::init()
                     .with_execution_providers([CoreMLExecutionProvider::default().build()])
-                    .commit()?;
+                    .commit();
             }
             #[cfg(feature = "directml")]
             Device::DirectML => {
                 eprintln!("Using DirectML execution");
                 ort::init()
                     .with_execution_providers([DirectMLExecutionProvider::default().build()])
-                    .commit()?;
+                    .commit();
             }
             #[cfg(feature = "rocm")]
             Device::ROCm => {
                 eprintln!("Using ROCm execution for AMD GPU");
                 ort::init()
                     .with_execution_providers([ROCmExecutionProvider::default().build()])
-                    .commit()?;
+                    .commit();
             }
         }
 

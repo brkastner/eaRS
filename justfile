@@ -302,7 +302,7 @@ install-all:
     read -rp "Proceed with installation? [Y/n/custom]: " choice
     case "${choice:-y}" in
         [Yy]|"")
-            cargo install --path . --force --features "$FEATURE_STRING"
+            cargo install --path . --locked --force --features "$FEATURE_STRING"
             ;;
         [Cc]*)
             echo ""
@@ -330,7 +330,7 @@ install-all:
             FEATURE_STRING=$(IFS=,; echo "${FEATURES[*]}")
             
             echo "Installing with features: $FEATURE_STRING"
-            cargo install --path . --force --features "$FEATURE_STRING"
+            cargo install --path . --locked --force --features "$FEATURE_STRING"
             ;;
         *)
             echo "Installation cancelled"
@@ -431,7 +431,7 @@ install-ears-features features:
         export SENTENCEPIECE_SYS_USE_PKG_CONFIG=1
     fi
     
-    cargo install --path . --force --features {{features}}
+    cargo install --path . --locked --force --features {{features}}
 
 # Install ears with default features (CPU only)
 install-ears-default:
@@ -451,7 +451,7 @@ install-ears-default:
         export SENTENCEPIECE_SYS_USE_PKG_CONFIG=1
     fi
     
-    cargo install --path . --force
+    cargo install --path . --locked --force
 
 # Install ears with Metal acceleration (macOS)
 install-ears-metal:
@@ -459,7 +459,7 @@ install-ears-metal:
     set -euo pipefail
     
     just check-deps
-    cargo install --path . --force --features apple
+    cargo install --path . --locked --force --features apple
 
 # Install ears with CUDA acceleration (NVIDIA)
 install-ears-cuda:
@@ -495,7 +495,7 @@ install-ears-cuda:
         export SENTENCEPIECE_SYS_USE_PKG_CONFIG=1
     fi
     
-    cargo install --path . --force --features nvidia
+    cargo install --path . --locked --force --features nvidia
 
 # Install ears with CUDA + Parakeet (best for NVIDIA GPUs)
 install-ears-cuda-parakeet:
@@ -531,7 +531,7 @@ install-ears-cuda-parakeet:
         export SENTENCEPIECE_SYS_USE_PKG_CONFIG=1
     fi
     
-    cargo install --path . --force --features nvidia,parakeet
+    cargo install --path . --locked --force --features nvidia,parakeet
 
 # Install ears with Parakeet engine
 install-ears-parakeet:
@@ -567,7 +567,7 @@ install-ears-parakeet:
         export SENTENCEPIECE_SYS_USE_PKG_CONFIG=1
     fi
     
-    cargo install --path . --force --features parakeet
+    cargo install --path . --locked --force --features parakeet
 
 # === Maintenance ===
 

@@ -30,7 +30,7 @@ atty = "0.2"
 candle = { version = "0.9", package = "candle-core" }
 candle-nn = "0.9"
 whisper-rs = { version = "0.11", optional = true }
-clap = { version = "4.4.12", features = ["derive"] }
+clap = { version = "4.4.12", features = ["derive", "env"] }
 cpal = "0.16"
 crossbeam-channel = "0.5"
 hf-hub = "0.4.3"
@@ -59,6 +59,7 @@ ctrlc = { version = "3.4", features = ["termination"] }
 cudarc = { version = "0.17", optional = true, features = ["cuda-version-from-build-system"] }
 notifica = "3.0.2"
 webrtc-vad = { version = "0.4", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
 
 # Platform-specific sentencepiece configuration
 # All platforms: compile from source (static linking).
@@ -77,6 +78,9 @@ hooks = []
 
 # Engines
 parakeet = ["dep:prkt", "dep:webrtc-vad"]
+
+# LLM correction (requires Ollama or compatible endpoint)
+llm-correct = ["dep:reqwest"]
 
 # Acceleration (shared flags)
 nvidia = ["dep:cudarc", "candle/cuda", "candle-nn/cuda", "prkt/cuda"]

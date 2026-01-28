@@ -5,6 +5,8 @@ use ears::audio;
 #[cfg(feature = "hooks")]
 use ears::config::DictationHooksConfig;
 use ears::config::{AppConfig, DictationNotificationConfig};
+#[cfg(feature = "llm-correct")]
+use ears::llm_correct::{LlmCorrectConfig, SentenceCorrector};
 use ears::virtual_keyboard::{create_virtual_keyboard, VirtualKeyboard, SpecialKey};
 use futures_util::{SinkExt, StreamExt};
 use notifica::notify;
@@ -63,6 +65,30 @@ struct Args {
 
     #[arg(long, value_enum, help = "Select transcription engine (kyutai|parakeet)")]
     engine: Option<EngineArg>,
+
+    #[arg(
+        long,
+        env = "EARS_SERVER_URL",
+        help = "WebSocket URL of the eaRS server (e.g., ws://192.168.1.100:8765)"
+    )]
+    server: Option<String>,
+
+    #[cfg(feature = "llm-correct")]
+    #[arg(
+        long,
+        env = "EARS_OLLAMA_URL",
+        help = "Ollama API endpoint for LLM correction (e.g., http://192.168.1.100:11434)"
+    )]
+    ollama_url: Option<String>,
+
+    #[cfg(feature = "llm-correct")]
+    #[arg(
+        long,
+        env = "EARS_OLLAMA_MODEL",
+        default_value = "qwen2.5:7b",
+        help = "Ollama model for text correction"
+    )]
+    ollama_model: String,
 }
 
 fn get_pid_file() -> std::path::PathBuf {
@@ -98,8 +124,10 @@ fn remove_pid_file() {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let config = AppConfig::load().unwrap_or_default();
-    let port = config.server.websocket_port;
-    let url = format!("ws://127.0.0.1:{}", port);
+    let url = args.server.clone().unwrap_or_else(|| {
+        let port = config.server.websocket_port;
+        format!("ws://127.0.0.1:{}", port)
+    });
 
     write_pid_file()?;
 
@@ -279,6 +307,21 @@ async fn main() -> Result<()> {
                     .context("Failed to initialize virtual keyboard. \
                               On Linux/Wayland, ensure you are in the 'input' group.")?;
 
+                #[cfg(feature = "llm-correct")]
+                let mut corrector = {
+                    let ollama_url = args.ollama_url.clone()
+                        .unwrap_or_else(|| "http://localhost:11434".to_string());
+                    let config = LlmCorrectConfig {
+                        endpoint: ollama_url.clone(),
+                        model: args.ollama_model.clone(),
+                        timeout_secs: 10,
+                    };
+                    eprintln!("LLM correction enabled: {} ({})", config.model, ollama_url);
+                    SentenceCorrector::new(config)?
+                };
+                #[cfg(feature = "llm-correct")]
+                let mut sentence_buffer = SentenceBuffer::new();
+
                 let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<WriterCommand>();
 
                 if let Some(ref lang) = args.lang {
@@ -352,7 +395,26 @@ async fn main() -> Result<()> {
                                     Ok(Message::Text(text)) => {
                                         // eprintln!("[WS RECEIVED] {}", text);
                                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                                            handle_message(&json, &mut keyboard, &capturing)?;
+                                            #[cfg(feature = "llm-correct")]
+                                            {
+                                                let is_capturing = *capturing.lock().unwrap();
+                                                if is_capturing {
+                                                    if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                        if let Err(e) = handle_word_with_correction(
+                                                            word,
+                                                            &mut keyboard,
+                                                            &mut sentence_buffer,
+                                                            &mut corrector,
+                                                        ).await {
+                                                            eprintln!("[ERROR] {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            #[cfg(not(feature = "llm-correct"))]
+                                            {
+                                                handle_message(&json, &mut keyboard, &capturing)?;
+                                            }
                                         } else {
                                             eprintln!("[ERROR] Failed to parse JSON");
                                         }
@@ -413,9 +475,46 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Tracks typed words for sentence-level correction
+#[cfg(feature = "llm-correct")]
+struct SentenceBuffer {
+    words: Vec<String>,
+    /// Total characters typed (including spaces)
+    char_count: usize,
+}
+
+#[cfg(feature = "llm-correct")]
+impl SentenceBuffer {
+    fn new() -> Self {
+        Self { words: Vec::new(), char_count: 0 }
+    }
+
+    fn add_word(&mut self, word: &str) {
+        if !self.words.is_empty() {
+            self.char_count += 1; // space
+        }
+        self.char_count += word.len();
+        self.words.push(word.to_string());
+    }
+
+    fn take_sentence(&mut self) -> (String, usize) {
+        let sentence = self.words.join(" ");
+        let chars = self.char_count;
+        self.words.clear();
+        self.char_count = 0;
+        (sentence, chars)
+    }
+
+    fn is_sentence_end(word: &str) -> bool {
+        let trimmed = word.trim();
+        trimmed.ends_with('.') || trimmed.ends_with('?') || trimmed.ends_with('!')
+    }
+}
+
+#[cfg(not(feature = "llm-correct"))]
 fn handle_message(
-    json: &Value, 
-    keyboard: &mut Box<dyn VirtualKeyboard>, 
+    json: &Value,
+    keyboard: &mut Box<dyn VirtualKeyboard>,
     capturing: &Arc<Mutex<bool>>
 ) -> Result<()> {
     let is_capturing = *capturing.lock().unwrap();
@@ -424,7 +523,9 @@ fn handle_message(
         match event_type {
             "word" if is_capturing => {
                 if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
-                    if !word.is_empty() {
+                    // Skip empty words and punctuation-only words
+                    let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                    if !word.is_empty() && has_alphanumeric {
                         // eprintln!("[TYPING WORD] {}", word);
                         keyboard.type_text(word)?;
                         keyboard.press_key(SpecialKey::Space)?;
@@ -439,6 +540,55 @@ fn handle_message(
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Handle a word with optional LLM correction
+#[cfg(feature = "llm-correct")]
+async fn handle_word_with_correction(
+    word: &str,
+    keyboard: &mut Box<dyn VirtualKeyboard>,
+    buffer: &mut SentenceBuffer,
+    corrector: &mut SentenceCorrector,
+) -> Result<()> {
+    // Skip empty words and punctuation-only words
+    let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+    if word.is_empty() || !has_alphanumeric {
+        return Ok(());
+    }
+
+    // Type the word immediately
+    keyboard.type_text(word)?;
+    keyboard.press_key(SpecialKey::Space)?;
+    buffer.add_word(word);
+
+    // Check if this is end of sentence
+    if SentenceBuffer::is_sentence_end(word) && buffer.words.len() >= 2 {
+        let (original, char_count) = buffer.take_sentence();
+
+        // Get correction from LLM
+        match corrector.correct_sentence(&original).await {
+            Ok(corrected) if corrected != original => {
+                eprintln!("[CORRECTION] '{}' -> '{}'", original, corrected);
+
+                // Backspace the original text (including trailing space)
+                for _ in 0..=char_count {
+                    keyboard.press_key(SpecialKey::Backspace)?;
+                }
+
+                // Type corrected text
+                keyboard.type_text(&corrected)?;
+                keyboard.press_key(SpecialKey::Space)?;
+            }
+            Ok(_) => {
+                // No correction needed
+            }
+            Err(e) => {
+                eprintln!("[CORRECTION ERROR] {}", e);
+            }
+        }
+    }
+
     Ok(())
 }
 

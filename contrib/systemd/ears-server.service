@@ -1,0 +1,19 @@
+[Unit]
+Description=eaRS speech-to-text server
+After=graphical-session.target pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p %h/.local/state/ears
+ExecStart=%h/.cargo/bin/ears-server --engine parakeet --parakeet-noise-gate-rms 0
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:%h/.local/state/ears/server.log
+StandardError=append:%h/.local/state/ears/server.log
+
+# For remote access (Tailscale), override with:
+# ExecStart=%h/.cargo/bin/ears-server --engine parakeet --bind 0.0.0.0:8765
+
+[Install]
+WantedBy=default.target

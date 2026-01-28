@@ -1,0 +1,16 @@
+[Unit]
+Description=eaRS dictation client
+After=ears-server.service
+Requires=ears-server.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p %h/.local/state/ears
+ExecStart=%h/.cargo/bin/ears-dictation
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:%h/.local/state/ears/dictation.log
+StandardError=append:%h/.local/state/ears/dictation.log
+
+[Install]
+WantedBy=default.target

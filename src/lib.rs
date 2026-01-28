@@ -11,6 +11,8 @@ pub mod virtual_keyboard;
 pub use kaudio;
 #[cfg(feature = "whisper")]
 pub mod whisper;
+#[cfg(feature = "llm-correct")]
+pub mod llm_correct;
 #[cfg(not(feature = "whisper"))]
 pub mod whisper {
     use anyhow::Result;
