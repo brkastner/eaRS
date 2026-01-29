@@ -654,37 +654,129 @@ async fn main() -> Result<()> {
                             {
                                 // Small delay to allow any in-flight words to arrive
                                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                // Drain any remaining words from websocket
-                                loop {
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_millis(100),
-                                        read.next()
-                                    ).await {
-                                        Ok(Some(Ok(Message::Text(text)))) => {
-                                            if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                                                if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
-                                                    let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
-                                                    if !word.is_empty() && has_alphanumeric {
-                                                        keyboard.type_text(word).ok();
-                                                        keyboard.press_key(SpecialKey::Space).ok();
-                                                        correction_buffer.add_word(word);
+
+                                // Preview mode: drain words to overlay, run final correction, then commit
+                                #[cfg(feature = "preview-overlay")]
+                                if preview_mode {
+                                    // Drain any remaining words to overlay
+                                    loop {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(100),
+                                            read.next()
+                                        ).await {
+                                            Ok(Some(Ok(Message::Text(text)))) => {
+                                                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                    if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                        let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                        if !word.is_empty() && has_alphanumeric {
+                                                            if let Some(ref handle) = overlay_handle {
+                                                                let _ = handle.send_word(word.to_string());
+                                                            }
+                                                            correction_buffer.add_word(word);
+                                                        }
                                                     }
                                                 }
                                             }
+                                            _ => break,
                                         }
-                                        _ => break, // timeout or error
                                     }
-                                }
-                                if correction_buffer.paragraph_len() >= 2 {
-                                    write_status("processing");
-                                    if let Err(e) = correct_final_paragraph(
-                                        &mut keyboard,
-                                        &mut correction_buffer,
-                                        &mut corrector,
-                                    ).await {
-                                        eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
+                                    // Run final correction through overlay
+                                    if correction_buffer.paragraph_len() >= 2 {
+                                        if let Some(ref handle) = overlay_handle {
+                                            let _ = handle.set_status(OverlayStatus::Correcting);
+                                        }
+                                        write_status("processing");
+                                        let (paragraph, _word_count) = correction_buffer.take_paragraph();
+                                        match corrector.correct_sentence(&paragraph).await {
+                                            Ok(corrected) if corrected != paragraph => {
+                                                eprintln!("[TOGGLE-OFF FINAL] '{}' -> '{}'", paragraph, corrected);
+                                                if let Some(ref handle) = overlay_handle {
+                                                    let _ = handle.send_correction(corrected);
+                                                }
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e),
+                                        }
+                                    }
+                                    // Commit overlay (paste buffer, close window)
+                                    if let Some(ref handle) = overlay_handle {
+                                        eprintln!("[TOGGLE-OFF] Committing overlay");
+                                        let _ = handle.commit();
                                     }
                                     write_status("paused");
+                                }
+
+                                // Normal mode: drain words, type directly
+                                #[cfg(feature = "preview-overlay")]
+                                if !preview_mode {
+                                    // Drain any remaining words from websocket
+                                    loop {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(100),
+                                            read.next()
+                                        ).await {
+                                            Ok(Some(Ok(Message::Text(text)))) => {
+                                                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                    if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                        let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                        if !word.is_empty() && has_alphanumeric {
+                                                            keyboard.type_text(word).ok();
+                                                            keyboard.press_key(SpecialKey::Space).ok();
+                                                            correction_buffer.add_word(word);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    if correction_buffer.paragraph_len() >= 2 {
+                                        write_status("processing");
+                                        if let Err(e) = correct_final_paragraph(
+                                            &mut keyboard,
+                                            &mut correction_buffer,
+                                            &mut corrector,
+                                        ).await {
+                                            eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
+                                        }
+                                        write_status("paused");
+                                    }
+                                }
+
+                                // Non-preview-overlay build
+                                #[cfg(not(feature = "preview-overlay"))]
+                                {
+                                    loop {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(100),
+                                            read.next()
+                                        ).await {
+                                            Ok(Some(Ok(Message::Text(text)))) => {
+                                                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                    if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                        let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                        if !word.is_empty() && has_alphanumeric {
+                                                            keyboard.type_text(word).ok();
+                                                            keyboard.press_key(SpecialKey::Space).ok();
+                                                            correction_buffer.add_word(word);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                    if correction_buffer.paragraph_len() >= 2 {
+                                        write_status("processing");
+                                        if let Err(e) = correct_final_paragraph(
+                                            &mut keyboard,
+                                            &mut correction_buffer,
+                                            &mut corrector,
+                                        ).await {
+                                            eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
+                                        }
+                                        write_status("paused");
+                                    }
                                 }
                             }
                         }

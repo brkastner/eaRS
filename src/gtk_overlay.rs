@@ -134,37 +134,38 @@ window {
 
 .committed-text {
     color: rgba(128, 128, 128, 0.9);
-    font-size: 14px;
+    font-size: 18px;
 }
 
 .active-text {
     color: rgba(240, 240, 240, 1.0);
-    font-size: 16px;
+    font-size: 20px;
 }
 
 .waiting-text {
     color: rgba(100, 100, 100, 0.8);
+    font-size: 18px;
     font-style: italic;
 }
 
 .status-listening {
     color: rgba(100, 200, 100, 1.0);
-    font-size: 12px;
+    font-size: 14px;
 }
 
 .status-correcting {
     color: rgba(200, 200, 100, 1.0);
-    font-size: 12px;
+    font-size: 14px;
 }
 
 .status-paused {
     color: rgba(150, 150, 150, 1.0);
-    font-size: 12px;
+    font-size: 14px;
 }
 
 .word-count {
     color: rgba(100, 100, 100, 0.8);
-    font-size: 11px;
+    font-size: 13px;
 }
 
 separator {
