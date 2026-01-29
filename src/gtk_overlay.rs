@@ -256,3 +256,135 @@ impl OverlayState {
         self.status_label.set_label(self.status.as_str());
     }
 }
+
+fn build_window(
+    app: &Application,
+    window_width: u32,
+    window_height: u32,
+    command_rx: AsyncReceiver<OverlayCommand>,
+    response_tx: Sender<OverlayResponse>,
+) {
+    let window = ApplicationWindow::builder()
+        .application(app)
+        .title("eaRS Preview")
+        .default_width(window_width as i32)
+        .default_height(window_height as i32)
+        .build();
+
+    // Initialize layer-shell BEFORE presenting window
+    window.init_layer_shell();
+    window.set_layer(gtk4_layer_shell::Layer::Overlay);
+    window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+
+    // Position at bottom-right with margins
+    window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
+    window.set_anchor(gtk4_layer_shell::Edge::Right, true);
+    window.set_margin(gtk4_layer_shell::Edge::Bottom, 32);
+    window.set_margin(gtk4_layer_shell::Edge::Right, 32);
+
+    // Set namespace for compositor identification
+    window.set_namespace("eaRS-dictation-overlay");
+
+    // Main vertical layout
+    let main_box = GtkBox::new(Orientation::Vertical, 0);
+
+    // Scrolled window for content
+    let scrolled = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .vexpand(true)
+        .build();
+
+    // Content box for text sections
+    let content_box = GtkBox::new(Orientation::Vertical, 4);
+    content_box.add_css_class("content-box");
+    scrolled.set_child(Some(&content_box));
+
+    // Status bar at bottom
+    let status_bar = GtkBox::new(Orientation::Horizontal, 8);
+    status_bar.set_margin_start(12);
+    status_bar.set_margin_end(12);
+    status_bar.set_margin_bottom(8);
+
+    let status_label = Label::new(Some("listening"));
+    status_label.add_css_class("status-listening");
+    status_label.set_halign(gtk4::Align::Start);
+    status_label.set_hexpand(true);
+
+    let word_count_label = Label::new(Some("0 words"));
+    word_count_label.add_css_class("word-count");
+    word_count_label.set_halign(gtk4::Align::End);
+
+    status_bar.append(&status_label);
+    status_bar.append(&word_count_label);
+
+    main_box.append(&scrolled);
+    main_box.append(&status_bar);
+    window.set_child(Some(&main_box));
+
+    // Create state
+    let state = Rc::new(RefCell::new(OverlayState {
+        buffer: PreviewBuffer::new(),
+        status: OverlayStatus::Listening,
+        response_tx,
+        content_box,
+        status_label,
+        word_count_label,
+    }));
+
+    // Initial display
+    state.borrow().update_display();
+    state.borrow().update_status_display();
+
+    // Handle commands from main thread using spawn_local
+    let state_clone = state.clone();
+    let window_clone = window.clone();
+    glib::spawn_future_local(async move {
+        while let Ok(cmd) = command_rx.recv().await {
+            let mut state = state_clone.borrow_mut();
+            match cmd {
+                OverlayCommand::Word(word) => {
+                    state.buffer.add_word(word);
+                    state.update_display();
+                }
+                OverlayCommand::Correction(corrected) => {
+                    state.buffer.apply_correction(corrected);
+                    state.update_display();
+                }
+                OverlayCommand::Checkpoint => {
+                    if let Some(text) = state.buffer.checkpoint() {
+                        let _ = state.response_tx.send(OverlayResponse::PasteText(text));
+                    }
+                    state.update_display();
+                }
+                OverlayCommand::Commit => {
+                    if let Some(text) = state.buffer.commit() {
+                        let _ = state.response_tx.send(OverlayResponse::PasteText(text));
+                    }
+                    let _ = state.response_tx.send(OverlayResponse::Closed);
+                    window_clone.close();
+                    break;
+                }
+                OverlayCommand::Close => {
+                    let _ = state.response_tx.send(OverlayResponse::Closed);
+                    window_clone.close();
+                    break;
+                }
+                OverlayCommand::Status(status) => {
+                    state.status = status;
+                    state.update_status_display();
+                }
+            }
+        }
+    });
+
+    // Handle window close
+    let state_close = state.clone();
+    window.connect_close_request(move |_| {
+        let state = state_close.borrow();
+        let _ = state.response_tx.send(OverlayResponse::Closed);
+        glib::Propagation::Proceed
+    });
+
+    window.present();
+}
