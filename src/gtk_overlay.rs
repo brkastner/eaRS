@@ -184,3 +184,75 @@ fn load_css() {
         gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 }
+
+/// Internal state for the overlay UI
+struct OverlayState {
+    buffer: PreviewBuffer,
+    status: OverlayStatus,
+    response_tx: Sender<OverlayResponse>,
+    content_box: GtkBox,
+    status_label: Label,
+    word_count_label: Label,
+}
+
+impl OverlayState {
+    fn update_display(&self) {
+        // Clear existing children
+        while let Some(child) = self.content_box.first_child() {
+            self.content_box.remove(&child);
+        }
+
+        let sections = self.buffer.display_sections();
+
+        if sections.is_empty() {
+            let label = Label::new(Some("Waiting for speech..."));
+            label.add_css_class("waiting-text");
+            label.set_wrap(true);
+            label.set_xalign(0.0);
+            self.content_box.append(&label);
+        } else {
+            for section in &sections {
+                match section.style {
+                    DisplayStyle::Committed => {
+                        let label = Label::new(Some(&section.text));
+                        label.add_css_class("committed-text");
+                        label.set_wrap(true);
+                        label.set_xalign(0.0);
+                        self.content_box.append(&label);
+                    }
+                    DisplayStyle::Active => {
+                        let label = Label::new(Some(&section.text));
+                        label.add_css_class("active-text");
+                        label.set_wrap(true);
+                        label.set_xalign(0.0);
+                        self.content_box.append(&label);
+                    }
+                    DisplayStyle::Separator => {
+                        let sep = gtk4::Separator::new(Orientation::Horizontal);
+                        self.content_box.append(&sep);
+                    }
+                }
+            }
+        }
+
+        // Update word count
+        self.word_count_label
+            .set_label(&format!("{} words", self.buffer.active_word_count()));
+    }
+
+    fn update_status_display(&self) {
+        // Remove old status classes
+        self.status_label.remove_css_class("status-listening");
+        self.status_label.remove_css_class("status-correcting");
+        self.status_label.remove_css_class("status-paused");
+
+        // Add new status class
+        let class = match self.status {
+            OverlayStatus::Listening => "status-listening",
+            OverlayStatus::Correcting => "status-correcting",
+            OverlayStatus::Paused => "status-paused",
+        };
+        self.status_label.add_css_class(class);
+        self.status_label.set_label(self.status.as_str());
+    }
+}
