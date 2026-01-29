@@ -3,7 +3,7 @@
 //! Uses Wayland layer-shell protocol for a non-focusable overlay
 //! that displays transcribed text without stealing keyboard focus.
 
-use crate::preview_buffer::{DisplaySection, DisplayStyle, PreviewBuffer};
+use crate::preview_buffer::{DisplayStyle, PreviewBuffer};
 use anyhow::Result;
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
 use gtk4::glib;
@@ -387,4 +387,51 @@ fn build_window(
     });
 
     window.present();
+}
+
+/// Spawn the overlay in a separate thread
+///
+/// Returns a handle to communicate with the overlay.
+/// The overlay runs its own GTK main loop in a dedicated thread.
+pub fn spawn_overlay(window_width: u32, window_height: u32) -> Result<OverlayHandle> {
+    // Channel for sending commands TO the overlay (async_channel for GTK thread)
+    let (command_tx, command_rx) = async_channel::unbounded();
+
+    // Channel for receiving responses FROM the overlay (standard mpsc for main thread)
+    let (response_tx, response_rx) = mpsc::channel();
+
+    // Spawn GTK thread
+    std::thread::spawn(move || {
+        // Check if layer-shell is supported (must be done after GTK init)
+        let app = Application::builder()
+            .application_id("com.ears.dictation.overlay")
+            .build();
+
+        // Store command_rx in a RefCell to transfer into the activate callback
+        let command_rx = std::cell::RefCell::new(Some(command_rx));
+        let response_tx = response_tx.clone();
+
+        app.connect_activate(move |app| {
+            // Check layer-shell support after GTK is initialized
+            if !gtk4_layer_shell::is_supported() {
+                eprintln!("Layer-shell not supported (are you running on Wayland?)");
+                return;
+            }
+
+            load_css();
+
+            // Take the receiver (can only activate once)
+            if let Some(rx) = command_rx.borrow_mut().take() {
+                build_window(app, window_width, window_height, rx, response_tx.clone());
+            }
+        });
+
+        // Run with empty args (we don't use GTK's arg parsing)
+        app.run_with_args::<&str>(&[]);
+    });
+
+    Ok(OverlayHandle {
+        command_tx,
+        response_rx,
+    })
 }
