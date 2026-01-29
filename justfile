@@ -583,8 +583,8 @@ overlay-install:
 overlay-restart:
     systemctl --user restart ears-dictation-remote
 
-# Build, install, and restart in one step
-overlay-deploy: overlay-build overlay-install overlay-restart
+# Build, install, and restart in one step (stops service first to avoid "Text file busy")
+overlay-deploy: overlay-build overlay-stop overlay-install overlay-restart
 
 # Follow the dictation service logs
 overlay-logs:
