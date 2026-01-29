@@ -103,6 +103,17 @@ cargo build --release --features parakeet,llm-correct,hooks
 --features apple    # Metal
 ```
 
+## Fork Context
+
+**IMPORTANT:** Before working on plans, exploring the codebase, or implementing features, read `docs/fork-context.md`. It contains:
+- Environment details (fw = laptop/niri, athena = desktop/Hyprland, Tailscale, Ollama)
+- Everything this fork adds over upstream (LLM correction, GTK4 overlay, pause detection)
+- Architecture diagram showing fw ↔ athena split
+- Build commands per machine
+- Feature flag reference
+- Comparison with hyprwhspr and rationale for eaRS design decisions
+- Future work (editable overlay via $EDITOR, hide/show daemon mode)
+
 ## Development Notes
 
 ### Feature Flags
