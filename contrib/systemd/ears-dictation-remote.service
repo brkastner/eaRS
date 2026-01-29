@@ -12,7 +12,7 @@ ExecStartPre=/bin/mkdir -p %h/.local/state/ears
 Environment=EARS_SERVER_URL=ws://desktop:8765
 Environment=EARS_OLLAMA_URL=http://desktop:11434
 Environment=EARS_OLLAMA_MODEL=qwen2.5:7b
-ExecStart=%h/.cargo/bin/ears-dictation
+ExecStart=%h/.cargo/bin/ears-dictation --preview
 Restart=on-failure
 RestartSec=2
 StandardOutput=append:%h/.local/state/ears/dictation.log

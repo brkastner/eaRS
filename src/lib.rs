@@ -13,6 +13,12 @@ pub use kaudio;
 pub mod whisper;
 #[cfg(feature = "llm-correct")]
 pub mod llm_correct;
+#[cfg(feature = "preview-overlay")]
+pub mod clipboard;
+#[cfg(feature = "preview-overlay")]
+pub mod preview_buffer;
+#[cfg(feature = "preview-overlay")]
+pub mod preview_overlay;
 #[cfg(not(feature = "whisper"))]
 pub mod whisper {
     use anyhow::Result;

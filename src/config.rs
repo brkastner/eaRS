@@ -71,6 +71,39 @@ pub struct DictationConfig {
     #[cfg(feature = "hooks")]
     #[serde(default)]
     pub hooks: DictationHooksConfig,
+    #[cfg(feature = "preview-overlay")]
+    #[serde(default)]
+    pub preview: PreviewConfig,
+}
+
+/// Configuration for preview overlay mode
+#[cfg(feature = "preview-overlay")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreviewConfig {
+    /// Enable preview overlay mode (buffer-first instead of type-first)
+    pub enabled: bool,
+    /// Hotkey to commit buffer and close overlay (e.g., "ctrl+shift+enter")
+    pub commit_hotkey: String,
+    /// Hotkey to checkpoint (paste current buffer, continue) (e.g., "kp_add")
+    pub checkpoint_hotkey: String,
+    /// Window width in pixels
+    pub window_width: u32,
+    /// Window height in pixels
+    pub window_height: u32,
+}
+
+#[cfg(feature = "preview-overlay")]
+impl Default for PreviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            commit_hotkey: "ctrl+shift+Return".to_string(),
+            checkpoint_hotkey: "KpAdd".to_string(),
+            window_width: 400,
+            window_height: 300,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +201,8 @@ impl Default for DictationConfig {
             notifications: DictationNotificationConfig::default(),
             #[cfg(feature = "hooks")]
             hooks: DictationHooksConfig::default(),
+            #[cfg(feature = "preview-overlay")]
+            preview: PreviewConfig::default(),
         }
     }
 }

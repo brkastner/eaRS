@@ -18,9 +18,21 @@ use enigo::{Direction, Enigo, Keyboard, Settings};
 pub trait VirtualKeyboard {
     /// Type text into the focused application
     fn type_text(&mut self, text: &str) -> Result<()>;
-    
+
     /// Press and release a special key
     fn press_key(&mut self, key: SpecialKey) -> Result<()>;
+
+    /// Delete N words using Ctrl+Backspace (faster than char-by-char)
+    fn delete_words(&mut self, count: usize) -> Result<()>;
+
+    /// Press a modifier key (hold it down)
+    fn press_modifier(&mut self, modifier: Modifier) -> Result<()>;
+
+    /// Release a modifier key
+    fn release_modifier(&mut self, modifier: Modifier) -> Result<()>;
+
+    /// Send a key chord (modifiers + character)
+    fn send_chord(&mut self, modifiers: &[Modifier], ch: char) -> Result<()>;
 }
 
 /// Special keys that can be pressed
@@ -36,6 +48,15 @@ pub enum SpecialKey {
     Right,
     Up,
     Down,
+}
+
+/// Modifier keys for key chords
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Super,
 }
 
 /// Create the appropriate keyboard implementation for the current platform
@@ -118,7 +139,7 @@ impl VirtualKeyboard for UInputKeyboard {
         }
         Ok(())
     }
-    
+
     fn press_key(&mut self, key: SpecialKey) -> Result<()> {
         let uinput_key = match key {
             SpecialKey::Enter => keyboard::Key::Enter,
@@ -132,10 +153,74 @@ impl VirtualKeyboard for UInputKeyboard {
             SpecialKey::Up => keyboard::Key::Up,
             SpecialKey::Down => keyboard::Key::Down,
         };
-        
+
         self.device.click(&uinput_key)?;
         self.device.synchronize()?;
+        // Delay between key events - longer for backspace to ensure apps process them
+        // Many apps rate-limit or buffer keyboard input; 15ms seems safe for most
+        let delay = if matches!(key, SpecialKey::Backspace) {
+            Duration::from_millis(15)
+        } else {
+            Duration::from_micros(500)
+        };
+        thread::sleep(delay);
         Ok(())
+    }
+
+    fn delete_words(&mut self, count: usize) -> Result<()> {
+        // Use Ctrl+Backspace to delete whole words (much faster than char-by-char)
+        for _ in 0..count {
+            self.device.press(&keyboard::Key::LeftControl)?;
+            self.device.click(&keyboard::Key::BackSpace)?;
+            self.device.release(&keyboard::Key::LeftControl)?;
+            self.device.synchronize()?;
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn press_modifier(&mut self, modifier: Modifier) -> Result<()> {
+        let key = modifier_to_uinput_key(modifier);
+        self.device.press(&key)?;
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    fn release_modifier(&mut self, modifier: Modifier) -> Result<()> {
+        let key = modifier_to_uinput_key(modifier);
+        self.device.release(&key)?;
+        self.device.synchronize()?;
+        Ok(())
+    }
+
+    fn send_chord(&mut self, modifiers: &[Modifier], ch: char) -> Result<()> {
+        // Press all modifiers
+        for &m in modifiers {
+            self.device.press(&modifier_to_uinput_key(m))?;
+        }
+
+        // Press the character key
+        let key = char_to_key(ch)?;
+        self.device.click(&key)?;
+
+        // Release all modifiers (in reverse order)
+        for &m in modifiers.iter().rev() {
+            self.device.release(&modifier_to_uinput_key(m))?;
+        }
+
+        self.device.synchronize()?;
+        thread::sleep(Duration::from_millis(5));
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn modifier_to_uinput_key(modifier: Modifier) -> keyboard::Key {
+    match modifier {
+        Modifier::Ctrl => keyboard::Key::LeftControl,
+        Modifier::Shift => keyboard::Key::LeftShift,
+        Modifier::Alt => keyboard::Key::LeftAlt,
+        Modifier::Super => keyboard::Key::LeftMeta,
     }
 }
 
@@ -199,10 +284,10 @@ impl VirtualKeyboard for EnigoKeyboard {
         self.enigo.text(text)
             .context("Failed to type text with enigo")
     }
-    
+
     fn press_key(&mut self, key: SpecialKey) -> Result<()> {
         use enigo::Key::*;
-        
+
         let enigo_key = match key {
             SpecialKey::Enter => Return,
             SpecialKey::Backspace => Backspace,
@@ -215,8 +300,68 @@ impl VirtualKeyboard for EnigoKeyboard {
             SpecialKey::Up => UpArrow,
             SpecialKey::Down => DownArrow,
         };
-        
+
         self.enigo.key(enigo_key, Direction::Click)
             .context("Failed to press key with enigo")
+    }
+
+    fn delete_words(&mut self, count: usize) -> Result<()> {
+        use enigo::Key::*;
+        // Use Ctrl+Backspace to delete whole words
+        for _ in 0..count {
+            self.enigo.key(Control, Direction::Press)
+                .context("Failed to press Ctrl")?;
+            self.enigo.key(Backspace, Direction::Click)
+                .context("Failed to press Backspace")?;
+            self.enigo.key(Control, Direction::Release)
+                .context("Failed to release Ctrl")?;
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn press_modifier(&mut self, modifier: Modifier) -> Result<()> {
+        let key = modifier_to_enigo_key(modifier);
+        self.enigo.key(key, Direction::Press)
+            .context("Failed to press modifier")
+    }
+
+    fn release_modifier(&mut self, modifier: Modifier) -> Result<()> {
+        let key = modifier_to_enigo_key(modifier);
+        self.enigo.key(key, Direction::Release)
+            .context("Failed to release modifier")
+    }
+
+    fn send_chord(&mut self, modifiers: &[Modifier], ch: char) -> Result<()> {
+        use enigo::Key::Unicode;
+
+        // Press all modifiers
+        for &m in modifiers {
+            self.enigo.key(modifier_to_enigo_key(m), Direction::Press)
+                .context("Failed to press modifier")?;
+        }
+
+        // Press the character key
+        self.enigo.key(Unicode(ch), Direction::Click)
+            .context("Failed to press character")?;
+
+        // Release all modifiers (in reverse order)
+        for &m in modifiers.iter().rev() {
+            self.enigo.key(modifier_to_enigo_key(m), Direction::Release)
+                .context("Failed to release modifier")?;
+        }
+
+        thread::sleep(Duration::from_millis(5));
+        Ok(())
+    }
+}
+
+fn modifier_to_enigo_key(modifier: Modifier) -> enigo::Key {
+    use enigo::Key::*;
+    match modifier {
+        Modifier::Ctrl => Control,
+        Modifier::Shift => Shift,
+        Modifier::Alt => Alt,
+        Modifier::Super => Meta,
     }
 }

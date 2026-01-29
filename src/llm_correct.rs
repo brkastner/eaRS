@@ -137,7 +137,7 @@ impl SentenceCorrector {
     /// Send a chunk to the LLM for correction
     pub async fn correct_sentence(&self, sentence: &str) -> Result<String> {
         let prompt = format!(
-            r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Output ONLY the corrected text, nothing else.
+            r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
 
 Text: {}"#,
             sentence
@@ -154,6 +154,7 @@ Text: {}"#,
 - Grammar and punctuation
 - Remove filler words (uh, um)
 - Fix sentence boundaries
+IMPORTANT: Preserve all line breaks and paragraph structure exactly.
 Output ONLY the corrected text, preserving meaning.
 
 Text: {}"#,

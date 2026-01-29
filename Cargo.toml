@@ -61,6 +61,11 @@ notifica = "3.0.2"
 webrtc-vad = { version = "0.4", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 
+# Preview overlay dependencies
+eframe = { version = "0.30", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+wl-clipboard-rs = { version = "0.9", optional = true }
+arboard = { version = "3.4", optional = true }
+
 # Platform-specific sentencepiece configuration
 # All platforms: compile from source (static linking).
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -81,6 +86,9 @@ parakeet = ["dep:prkt", "dep:webrtc-vad"]
 
 # LLM correction (requires Ollama or compatible endpoint)
 llm-correct = ["dep:reqwest"]
+
+# Preview overlay mode (buffer-first dictation with egui window)
+preview-overlay = ["dep:eframe", "dep:wl-clipboard-rs", "dep:arboard", "llm-correct"]
 
 # Acceleration (shared flags)
 nvidia = ["dep:cudarc", "candle/cuda", "candle-nn/cuda", "prkt/cuda"]

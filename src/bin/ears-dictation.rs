@@ -8,6 +8,10 @@ use ears::config::{AppConfig, DictationNotificationConfig};
 #[cfg(feature = "llm-correct")]
 use ears::llm_correct::{LlmCorrectConfig, SentenceCorrector};
 use ears::virtual_keyboard::{create_virtual_keyboard, VirtualKeyboard, SpecialKey};
+#[cfg(feature = "preview-overlay")]
+use ears::clipboard::copy_and_paste;
+#[cfg(feature = "preview-overlay")]
+use ears::preview_overlay::{spawn_overlay, OverlayHandle, OverlayResponse, OverlayStatus};
 use futures_util::{SinkExt, StreamExt};
 use notifica::notify;
 use rdev::{EventType, listen};
@@ -92,6 +96,13 @@ struct Args {
         help = "Ollama model for text correction"
     )]
     ollama_model: String,
+
+    #[cfg(feature = "preview-overlay")]
+    #[arg(
+        long,
+        help = "Enable preview overlay mode (buffer-first with popup window)"
+    )]
+    preview: bool,
 }
 
 fn get_state_dir() -> std::path::PathBuf {
@@ -156,6 +167,39 @@ async fn main() -> Result<()> {
     let dictation_state = Arc::new(Mutex::new(DictationState::Inactive));
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
+    // Channel to signal "trigger final correction now" from toggle handlers
+    #[cfg(feature = "llm-correct")]
+    let (final_correct_tx, final_correct_rx) = bounded::<()>(1);
+    #[cfg(not(feature = "llm-correct"))]
+    let (_, final_correct_rx) = bounded::<()>(1);
+
+    // Channels for preview overlay commands (checkpoint/commit)
+    // Always created but only used when preview-overlay feature is enabled
+    let (checkpoint_tx, checkpoint_rx) = bounded::<()>(1);
+    let (commit_tx, commit_rx) = bounded::<()>(1);
+
+    // Spawn preview overlay if enabled
+    #[cfg(feature = "preview-overlay")]
+    let overlay_handle: Option<OverlayHandle> = if args.preview {
+        let preview_config = &config.dictation.preview;
+        match spawn_overlay(preview_config.window_width, preview_config.window_height) {
+            Ok(handle) => {
+                eprintln!("Preview overlay spawned");
+                Some(handle)
+            }
+            Err(e) => {
+                eprintln!("Failed to spawn preview overlay: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(feature = "preview-overlay")]
+    let preview_mode = args.preview && overlay_handle.is_some();
+    #[cfg(not(feature = "preview-overlay"))]
+    let preview_mode = false;
+
     let running_clone = running.clone();
 
     ctrlc::set_handler(move || {
@@ -165,6 +209,8 @@ async fn main() -> Result<()> {
     .context("Failed to set Ctrl+C handler")?;
 
     // SIGUSR1 toggles capturing state for external hotkey integration
+    #[cfg(feature = "llm-correct")]
+    let sig_final_tx = final_correct_tx.clone();
     {
         let sig_capturing = capturing.clone();
         let sig_state = dictation_state.clone();
@@ -186,6 +232,11 @@ async fn main() -> Result<()> {
                 } else {
                     DictationState::Suspended
                 };
+                // Trigger final correction when toggling OFF
+                #[cfg(feature = "llm-correct")]
+                if !is_active {
+                    let _ = sig_final_tx.send(());
+                }
                 #[cfg(feature = "hooks")]
                 apply_state_change(&sig_state, event, &sig_notif, &sig_hooks);
                 #[cfg(not(feature = "hooks"))]
@@ -207,6 +258,15 @@ async fn main() -> Result<()> {
         #[cfg(feature = "hooks")]
         let hook_config_thread = hook_config.clone();
         let notification_config_thread = notification_config.clone();
+        #[cfg(feature = "llm-correct")]
+        let hotkey_final_tx = final_correct_tx.clone();
+        let hotkey_checkpoint_tx = checkpoint_tx.clone();
+        let hotkey_commit_tx = commit_tx.clone();
+        #[cfg(feature = "preview-overlay")]
+        let preview_config_hotkeys = config.dictation.preview.clone();
+        let _hotkey_preview_mode = preview_mode;
+        #[cfg(feature = "preview-overlay")]
+        let hotkey_preview_mode = _hotkey_preview_mode;
         thread::spawn(move || {
             let toggle_combo = hotkey_config.toggle.to_lowercase();
             let (t_ctrl, t_shift, t_alt, t_key) = parse_combo(&toggle_combo);
@@ -214,6 +274,26 @@ async fn main() -> Result<()> {
                 "Parsed combo - ctrl:{} shift:{} alt:{} key:{:?}",
                 t_ctrl, t_shift, t_alt, t_key
             );
+
+            // Parse preview hotkeys
+            #[cfg(feature = "preview-overlay")]
+            let (cp_ctrl, cp_shift, cp_alt, cp_key) = if hotkey_preview_mode {
+                let combo = parse_combo(&preview_config_hotkeys.checkpoint_hotkey);
+                eprintln!("Checkpoint hotkey: {} -> ctrl:{} shift:{} alt:{} key:{:?}",
+                         preview_config_hotkeys.checkpoint_hotkey, combo.0, combo.1, combo.2, combo.3);
+                combo
+            } else {
+                (false, false, false, rdev::Key::Unknown(0))
+            };
+            #[cfg(feature = "preview-overlay")]
+            let (cm_ctrl, cm_shift, cm_alt, cm_key) = if hotkey_preview_mode {
+                let combo = parse_combo(&preview_config_hotkeys.commit_hotkey);
+                eprintln!("Commit hotkey: {} -> ctrl:{} shift:{} alt:{} key:{:?}",
+                         preview_config_hotkeys.commit_hotkey, combo.0, combo.1, combo.2, combo.3);
+                combo
+            } else {
+                (false, false, false, rdev::Key::Unknown(0))
+            };
 
             if let Err(e) = listen(move |event| -> () {
                 static mut CTRL: bool = false;
@@ -257,6 +337,11 @@ async fn main() -> Result<()> {
                                 if is_active { "started" } else { "stopped" }
                             );
                             drop(c);
+                            // Trigger final correction when toggling OFF
+                            #[cfg(feature = "llm-correct")]
+                            if !is_active {
+                                let _ = hotkey_final_tx.send(());
+                            }
                             let event = if is_active {
                                 DictationState::Listening
                             } else {
@@ -276,6 +361,37 @@ async fn main() -> Result<()> {
                                 &notification_config_thread,
                             );
                         }
+
+                        // Preview mode: checkpoint hotkey
+                        #[cfg(feature = "preview-overlay")]
+                        {
+                            if hotkey_preview_mode
+                                && CTRL == cp_ctrl
+                                && SHIFT == cp_shift
+                                && ALT == cp_alt
+                                && k == cp_key
+                            {
+                                eprintln!("Checkpoint hotkey pressed");
+                                let _ = hotkey_checkpoint_tx.send(());
+                            }
+
+                            // Preview mode: commit hotkey
+                            if hotkey_preview_mode
+                                && CTRL == cm_ctrl
+                                && SHIFT == cm_shift
+                                && ALT == cm_alt
+                                && k == cm_key
+                            {
+                                eprintln!("Commit hotkey pressed");
+                                let _ = hotkey_commit_tx.send(());
+                            }
+                        }
+                        // Suppress unused warnings when preview-overlay is not enabled
+                        #[cfg(not(feature = "preview-overlay"))]
+                        {
+                            let _ = &hotkey_checkpoint_tx;
+                            let _ = &hotkey_commit_tx;
+                        }
                     },
                     _ => {}
                 }
@@ -285,17 +401,18 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Start in paused state - user must toggle to begin capturing
     #[cfg(feature = "hooks")]
     apply_state_change(
         &dictation_state,
-        DictationState::Listening,
+        DictationState::Suspended,
         &notification_config,
         &hook_config,
     );
     #[cfg(not(feature = "hooks"))]
     apply_state_change(
         &dictation_state,
-        DictationState::Listening,
+        DictationState::Suspended,
         &notification_config,
     );
 
@@ -407,9 +524,89 @@ async fn main() -> Result<()> {
                 });
 
                 loop {
+                    // Check for overlay responses (paste text)
+                    #[cfg(feature = "preview-overlay")]
+                    if let Some(ref handle) = overlay_handle {
+                        if let Some(response) = handle.try_recv() {
+                            match response {
+                                OverlayResponse::PasteText(text) => {
+                                    eprintln!("[PREVIEW] Pasting text: {} chars", text.len());
+                                    if let Err(e) = copy_and_paste(&text, keyboard.as_mut()) {
+                                        eprintln!("[PREVIEW PASTE ERROR] {}", e);
+                                    }
+                                }
+                                OverlayResponse::Closed => {
+                                    eprintln!("[PREVIEW] Overlay closed");
+                                }
+                            }
+                        }
+                    }
+
                     select! {
                         recv(stop_rx) -> _ => {
+                            #[cfg(feature = "preview-overlay")]
+                            if let Some(ref handle) = overlay_handle {
+                                let _ = handle.close();
+                            }
                             break;
+                        }
+                        // Preview mode: checkpoint (paste current buffer, continue)
+                        recv(checkpoint_rx) -> _ => {
+                            #[cfg(feature = "preview-overlay")]
+                            if let Some(ref handle) = overlay_handle {
+                                if let Err(e) = handle.checkpoint() {
+                                    eprintln!("[CHECKPOINT ERROR] {}", e);
+                                }
+                            }
+                        }
+                        // Preview mode: commit (paste all, close overlay)
+                        recv(commit_rx) -> _ => {
+                            #[cfg(feature = "preview-overlay")]
+                            if let Some(ref handle) = overlay_handle {
+                                if let Err(e) = handle.commit() {
+                                    eprintln!("[COMMIT ERROR] {}", e);
+                                }
+                            }
+                        }
+                        // Trigger final correction when capture is toggled off
+                        recv(final_correct_rx) -> _ => {
+                            #[cfg(feature = "llm-correct")]
+                            {
+                                // Small delay to allow any in-flight words to arrive
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                // Drain any remaining words from websocket
+                                loop {
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_millis(100),
+                                        read.next()
+                                    ).await {
+                                        Ok(Some(Ok(Message::Text(text)))) => {
+                                            if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                    let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                    if !word.is_empty() && has_alphanumeric {
+                                                        keyboard.type_text(word).ok();
+                                                        keyboard.press_key(SpecialKey::Space).ok();
+                                                        correction_buffer.add_word(word);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => break, // timeout or error
+                                    }
+                                }
+                                if correction_buffer.paragraph_len() >= 2 {
+                                    write_status("processing");
+                                    if let Err(e) = correct_final_paragraph(
+                                        &mut keyboard,
+                                        &mut correction_buffer,
+                                        &mut corrector,
+                                    ).await {
+                                        eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
+                                    }
+                                    write_status("paused");
+                                }
+                            }
                         }
                         default(std::time::Duration::from_millis(200)) => {
                             // Use timeout to avoid blocking forever on websocket read
@@ -423,26 +620,76 @@ async fn main() -> Result<()> {
                                     Ok(Message::Text(text)) => {
                                         // eprintln!("[WS RECEIVED] {}", text);
                                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                                            #[cfg(feature = "llm-correct")]
-                                            {
+                                            // Preview mode: send words to overlay instead of typing
+                                            #[cfg(feature = "preview-overlay")]
+                                            if preview_mode {
                                                 let is_capturing = *capturing.lock().unwrap();
                                                 if is_capturing {
                                                     if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
-                                                        last_word_time = Instant::now();
-                                                        if let Err(e) = handle_word_with_correction(
-                                                            word,
-                                                            &mut keyboard,
-                                                            &mut correction_buffer,
-                                                            &mut corrector,
-                                                        ).await {
-                                                            eprintln!("[ERROR] {}", e);
+                                                        let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                        if !word.is_empty() && has_alphanumeric {
+                                                            #[cfg(feature = "llm-correct")]
+                                                            { last_word_time = Instant::now(); }
+                                                            if let Some(ref handle) = overlay_handle {
+                                                                if let Err(e) = handle.send_word(word.to_string()) {
+                                                                    eprintln!("[PREVIEW WORD ERROR] {}", e);
+                                                                }
+                                                                // Also add to correction buffer for LLM correction
+                                                                #[cfg(feature = "llm-correct")]
+                                                                correction_buffer.add_word(word);
+                                                            }
                                                         }
                                                     }
                                                 }
+                                            } else {
+                                                // Normal mode: type directly
+                                                #[cfg(feature = "llm-correct")]
+                                                {
+                                                    let is_capturing = *capturing.lock().unwrap();
+                                                    if is_capturing {
+                                                        if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                            last_word_time = Instant::now();
+                                                            if let Err(e) = handle_word_with_correction(
+                                                                word,
+                                                                &mut keyboard,
+                                                                &mut correction_buffer,
+                                                                &mut corrector,
+                                                            ).await {
+                                                                eprintln!("[ERROR] {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                #[cfg(not(feature = "llm-correct"))]
+                                                {
+                                                    handle_message(&json, &mut keyboard, &capturing)?;
+                                                }
                                             }
-                                            #[cfg(not(feature = "llm-correct"))]
+
+                                            // Non-preview-overlay build: use normal handling
+                                            #[cfg(not(feature = "preview-overlay"))]
                                             {
-                                                handle_message(&json, &mut keyboard, &capturing)?;
+                                                #[cfg(feature = "llm-correct")]
+                                                {
+                                                    let is_capturing = *capturing.lock().unwrap();
+                                                    if is_capturing {
+                                                        if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                            last_word_time = Instant::now();
+                                                            if let Err(e) = handle_word_with_correction(
+                                                                word,
+                                                                &mut keyboard,
+                                                                &mut correction_buffer,
+                                                                &mut corrector,
+                                                            ).await {
+                                                                eprintln!("[ERROR] {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                #[cfg(not(feature = "llm-correct"))]
+                                                {
+                                                    handle_message(&json, &mut keyboard, &capturing)?;
+                                                }
                                             }
                                         } else {
                                             eprintln!("[ERROR] Failed to parse JSON");
@@ -467,24 +714,121 @@ async fn main() -> Result<()> {
                             }
                             // Timeout case (Err) - continue to check pause detection
 
-                            // Check for 5-second pause to trigger final paragraph correction
+                            // Check for pauses to trigger corrections
                             #[cfg(feature = "llm-correct")]
                             {
                                 let is_capturing = *capturing.lock().unwrap();
-                                if is_capturing
-                                    && last_word_time.elapsed() >= std::time::Duration::from_secs(5)
-                                    && correction_buffer.paragraph_len() >= 2
-                                {
-                                    write_status("processing");
-                                    if let Err(e) = correct_final_paragraph(
-                                        &mut keyboard,
-                                        &mut correction_buffer,
-                                        &mut corrector,
-                                    ).await {
-                                        eprintln!("[PAUSE CORRECTION ERROR] {}", e);
+                                let elapsed = last_word_time.elapsed();
+
+                                // Preview mode: send corrections to overlay instead of typing
+                                #[cfg(feature = "preview-overlay")]
+                                if preview_mode {
+                                    if is_capturing && elapsed >= std::time::Duration::from_millis(1500)
+                                        && correction_buffer.chunk_len() >= 2
+                                    {
+                                        // 1.5+ second pause: chunk correction for preview
+                                        let (original, _word_count, _original_words) = correction_buffer.take_chunk();
+                                        if let Some(ref handle) = overlay_handle {
+                                            let _ = handle.set_status(OverlayStatus::Correcting);
+                                        }
+                                        write_status("processing");
+                                        match corrector.correct_sentence(&original).await {
+                                            Ok(corrected) if corrected != original => {
+                                                eprintln!("[PREVIEW CHUNK] '{}' -> '{}'", original, corrected);
+                                                if let Some(ref handle) = overlay_handle {
+                                                    if let Err(e) = handle.send_correction(corrected) {
+                                                        eprintln!("[PREVIEW CORRECTION ERROR] {}", e);
+                                                    }
+                                                }
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => eprintln!("[PREVIEW CHUNK ERROR] {}", e),
+                                        }
+                                        if let Some(ref handle) = overlay_handle {
+                                            let _ = handle.set_status(OverlayStatus::Listening);
+                                        }
+                                        write_status("listening");
+                                        last_word_time = Instant::now();
                                     }
-                                    write_status("listening");
-                                    last_word_time = Instant::now();
+                                } else {
+                                    // Normal mode: type directly with backspace+retype
+                                    if is_capturing && elapsed >= std::time::Duration::from_secs(5)
+                                        && correction_buffer.paragraph_len() >= 2
+                                    {
+                                        // 5+ second pause: final paragraph correction
+                                        write_status("processing");
+                                        if let Err(e) = correct_final_paragraph(
+                                            &mut keyboard,
+                                            &mut correction_buffer,
+                                            &mut corrector,
+                                        ).await {
+                                            eprintln!("[FINAL ERROR] {}", e);
+                                        }
+                                        write_status("listening");
+                                        last_word_time = Instant::now();
+                                    } else if is_capturing && elapsed >= std::time::Duration::from_millis(1500)
+                                        && correction_buffer.chunk_len() >= 2
+                                    {
+                                        // 1.5+ second pause: chunk correction
+                                        let (original, word_count, original_words) = correction_buffer.take_chunk();
+                                        write_status("processing");
+                                        match corrector.correct_sentence(&original).await {
+                                            Ok(corrected) if corrected != original => {
+                                                eprintln!("[PAUSE CHUNK] '{}' -> '{}'", original, corrected);
+                                                // Delete trailing space first, then delete words
+                                                keyboard.press_key(SpecialKey::Backspace)?;
+                                                keyboard.delete_words(word_count)?;
+                                                keyboard.type_text(&corrected)?;
+                                                keyboard.press_key(SpecialKey::Space)?;
+                                                correction_buffer.apply_chunk_correction(&original_words, &corrected);
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => eprintln!("[PAUSE CHUNK ERROR] {}", e),
+                                        }
+                                        write_status("listening");
+                                        last_word_time = Instant::now();
+                                    }
+                                }
+
+                                // Non-preview-overlay build: use normal handling
+                                #[cfg(not(feature = "preview-overlay"))]
+                                {
+                                    if is_capturing && elapsed >= std::time::Duration::from_secs(5)
+                                        && correction_buffer.paragraph_len() >= 2
+                                    {
+                                        // 5+ second pause: final paragraph correction
+                                        write_status("processing");
+                                        if let Err(e) = correct_final_paragraph(
+                                            &mut keyboard,
+                                            &mut correction_buffer,
+                                            &mut corrector,
+                                        ).await {
+                                            eprintln!("[FINAL ERROR] {}", e);
+                                        }
+                                        write_status("listening");
+                                        last_word_time = Instant::now();
+                                    } else if is_capturing && elapsed >= std::time::Duration::from_millis(1500)
+                                        && correction_buffer.chunk_len() >= 2
+                                    {
+                                        // 1.5+ second pause: chunk correction
+                                        let (original, word_count, original_words) = correction_buffer.take_chunk();
+                                        write_status("processing");
+                                        match corrector.correct_sentence(&original).await {
+                                            Ok(corrected) if corrected != original => {
+                                                eprintln!("[PAUSE CHUNK] '{}' -> '{}'", original, corrected);
+                                                // Delete trailing space first, then delete words
+                                                keyboard.press_key(SpecialKey::Backspace)?;
+                                                keyboard.delete_words(word_count)?;
+                                                keyboard.type_text(&corrected)?;
+                                                keyboard.press_key(SpecialKey::Space)?;
+                                                correction_buffer.apply_chunk_correction(&original_words, &corrected);
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => eprintln!("[PAUSE CHUNK ERROR] {}", e),
+                                        }
+                                        write_status("listening");
+                                        last_word_time = Instant::now();
+                                    }
                                 }
                             }
                         }
@@ -569,22 +913,22 @@ impl CorrectionBuffer {
         self.paragraph_words.push(word.to_string());
     }
 
-    fn take_chunk(&mut self) -> (String, usize) {
+    fn take_chunk(&mut self) -> (String, usize, Vec<String>) {
         let text = self.chunk_words.join(" ");
-        let chars = self.chunk_char_count;
-        self.chunk_words.clear();
+        let word_count = self.chunk_words.len();
+        let words = std::mem::take(&mut self.chunk_words);
         self.chunk_char_count = 0;
-        (text, chars)
+        (text, word_count, words)
     }
 
     fn take_paragraph(&mut self) -> (String, usize) {
         let text = self.paragraph_words.join(" ");
-        let chars = self.paragraph_char_count;
+        let word_count = self.paragraph_words.len();
         self.paragraph_words.clear();
         self.paragraph_char_count = 0;
         self.chunk_words.clear();
         self.chunk_char_count = 0;
-        (text, chars)
+        (text, word_count)
     }
 
     fn should_correct_chunk(&self, word: &str) -> bool {
@@ -604,6 +948,36 @@ impl CorrectionBuffer {
 
     fn paragraph_len(&self) -> usize {
         self.paragraph_words.len()
+    }
+
+    /// Update paragraph after a chunk correction to reflect what's actually on screen
+    fn apply_chunk_correction(&mut self, original_words: &[String], corrected: &str) {
+        // Remove the original chunk words from paragraph
+        let chunk_len = original_words.len();
+        let old_para_len = self.paragraph_words.len();
+        if self.paragraph_words.len() >= chunk_len {
+            self.paragraph_words.truncate(self.paragraph_words.len() - chunk_len);
+        }
+
+        // Add the corrected words to paragraph
+        let corrected_words: Vec<&str> = corrected.split_whitespace().collect();
+        for word in &corrected_words {
+            self.paragraph_words.push(word.to_string());
+        }
+
+        let old_char_count = self.paragraph_char_count;
+        // Recalculate paragraph char count from actual words
+        self.paragraph_char_count = if self.paragraph_words.is_empty() {
+            0
+        } else {
+            self.paragraph_words.iter().map(|w| w.len()).sum::<usize>()
+                + self.paragraph_words.len() - 1 // spaces between words
+        };
+
+        eprintln!("[CHUNK APPLY] para_words: {} -> {}, para_chars: {} -> {}, corrected_len={}",
+                  old_para_len, self.paragraph_words.len(),
+                  old_char_count, self.paragraph_char_count,
+                  corrected.len());
     }
 }
 
@@ -660,21 +1034,23 @@ async fn handle_word_with_correction(
 
     // Check if we should correct this chunk
     if buffer.should_correct_chunk(word) && buffer.chunk_len() >= 2 {
-        let (original, char_count) = buffer.take_chunk();
+        let (original, word_count, original_words) = buffer.take_chunk();
 
         // Get correction from LLM
         match corrector.correct_sentence(&original).await {
             Ok(corrected) if corrected != original => {
                 eprintln!("[CHUNK] '{}' -> '{}'", original, corrected);
 
-                // Backspace the original text (including trailing space)
-                for _ in 0..=char_count {
-                    keyboard.press_key(SpecialKey::Backspace)?;
-                }
+                // Delete trailing space first, then delete words with Ctrl+Backspace
+                keyboard.press_key(SpecialKey::Backspace)?;
+                keyboard.delete_words(word_count)?;
 
                 // Type corrected text
                 keyboard.type_text(&corrected)?;
                 keyboard.press_key(SpecialKey::Space)?;
+
+                // Update paragraph to reflect what's actually on screen
+                buffer.apply_chunk_correction(&original_words, &corrected);
             }
             Ok(_) => {
                 // No correction needed
@@ -699,16 +1075,17 @@ async fn correct_final_paragraph(
         return Ok(());
     }
 
-    let (original, char_count) = buffer.take_paragraph();
+    let (original, word_count) = buffer.take_paragraph();
+
+    eprintln!("[FINAL DEBUG] word_count={}, original_len={}", word_count, original.len());
 
     match corrector.correct_paragraph(&original).await {
         Ok(corrected) if corrected != original => {
             eprintln!("[FINAL] '{}' -> '{}'", original, corrected);
 
-            // Backspace the entire paragraph (including trailing space)
-            for _ in 0..=char_count {
-                keyboard.press_key(SpecialKey::Backspace)?;
-            }
+            // Delete trailing space first, then delete words with Ctrl+Backspace
+            keyboard.press_key(SpecialKey::Backspace)?;
+            keyboard.delete_words(word_count)?;
 
             // Type corrected text
             keyboard.type_text(&corrected)?;
@@ -864,10 +1241,22 @@ fn parse_combo(s: &str) -> (bool, bool, bool, rdev::Key) {
     let mut key = rdev::Key::Unknown(0);
 
     for part in s.split('+') {
-        match part.trim() {
+        let part = part.trim().to_lowercase();
+        match part.as_str() {
             "ctrl" | "control" => ctrl = true,
             "shift" => shift = true,
             "alt" => alt = true,
+            // Special keys
+            "return" | "enter" => key = rdev::Key::Return,
+            "kpadd" | "kp_add" | "numpadplus" => key = rdev::Key::KpPlus,
+            "kpminus" | "kp_minus" | "numpadminus" => key = rdev::Key::KpMinus,
+            "kpenter" | "kp_enter" | "numpadenter" => key = rdev::Key::KpReturn,
+            "space" => key = rdev::Key::Space,
+            "tab" => key = rdev::Key::Tab,
+            "escape" | "esc" => key = rdev::Key::Escape,
+            "backspace" => key = rdev::Key::Backspace,
+            "delete" => key = rdev::Key::Delete,
+            // Letter keys
             k if k.len() == 1 => {
                 if let Some(ch) = k.chars().next() {
                     key = match ch {
