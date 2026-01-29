@@ -18,7 +18,7 @@ pub mod clipboard;
 #[cfg(feature = "preview-overlay")]
 pub mod preview_buffer;
 #[cfg(feature = "preview-overlay")]
-pub mod preview_overlay;
+pub mod gtk_overlay;
 #[cfg(not(feature = "whisper"))]
 pub mod whisper {
     use anyhow::Result;
