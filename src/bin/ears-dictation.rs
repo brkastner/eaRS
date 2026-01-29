@@ -30,6 +30,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const PID_FILE_NAME: &str = "dictation.pid";
 const STATUS_FILE_NAME: &str = "status.json";
 
+#[cfg(all(feature = "preview-overlay", feature = "llm-correct"))]
+const AUTO_COMMIT_PAUSE_SECS: u64 = 10;
+
 #[derive(Clone, Debug, clap::ValueEnum)]
 enum EngineArg {
     Kyutai,
@@ -826,6 +829,22 @@ async fn main() -> Result<()> {
                                         }
                                         write_status("listening");
                                         last_word_time = Instant::now();
+                                    }
+
+                                    // Auto-commit after extended silence (10+ seconds)
+                                    if is_capturing
+                                        && overlay_handle.is_some()
+                                        && elapsed.as_secs() >= AUTO_COMMIT_PAUSE_SECS
+                                        && correction_buffer.paragraph_len() > 0
+                                    {
+                                        eprintln!(
+                                            "[AUTO-COMMIT] {} seconds of silence, committing",
+                                            elapsed.as_secs()
+                                        );
+                                        if let Some(ref handle) = overlay_handle {
+                                            let _ = handle.commit();
+                                        }
+                                        *capturing.lock().unwrap() = false;
                                     }
                                 } else {
                                     // Normal mode: type directly with backspace+retype
