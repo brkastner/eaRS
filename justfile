@@ -569,6 +569,35 @@ install-ears-parakeet:
     
     cargo install --path . --locked --force --features parakeet
 
+# === Overlay (fw laptop) ===
+
+# Build dictation client with GTK4 overlay for fw
+overlay-build:
+    cargo build --release --features preview-overlay,parakeet,llm-correct,hooks
+
+# Install dictation client binary
+overlay-install:
+    cp target/release/ears-dictation ~/.cargo/bin/
+
+# Restart the remote dictation service
+overlay-restart:
+    systemctl --user restart ears-dictation-remote
+
+# Build, install, and restart in one step
+overlay-deploy: overlay-build overlay-install overlay-restart
+
+# Follow the dictation service logs
+overlay-logs:
+    journalctl --user -u ears-dictation-remote -f
+
+# Show dictation service status
+overlay-status:
+    systemctl --user status ears-dictation-remote
+
+# Stop the dictation service
+overlay-stop:
+    systemctl --user stop ears-dictation-remote
+
 # === Maintenance ===
 
 # Clean build artifacts
