@@ -121,3 +121,66 @@ impl OverlayHandle {
         }
     }
 }
+
+const OVERLAY_CSS: &str = r#"
+window {
+    background-color: rgba(30, 30, 35, 0.95);
+    border-radius: 8px;
+}
+
+.content-box {
+    padding: 12px;
+}
+
+.committed-text {
+    color: rgba(128, 128, 128, 0.9);
+    font-size: 14px;
+}
+
+.active-text {
+    color: rgba(240, 240, 240, 1.0);
+    font-size: 16px;
+}
+
+.waiting-text {
+    color: rgba(100, 100, 100, 0.8);
+    font-style: italic;
+}
+
+.status-listening {
+    color: rgba(100, 200, 100, 1.0);
+    font-size: 12px;
+}
+
+.status-correcting {
+    color: rgba(200, 200, 100, 1.0);
+    font-size: 12px;
+}
+
+.status-paused {
+    color: rgba(150, 150, 150, 1.0);
+    font-size: 12px;
+}
+
+.word-count {
+    color: rgba(100, 100, 100, 0.8);
+    font-size: 11px;
+}
+
+separator {
+    background-color: rgba(80, 80, 80, 0.5);
+    min-height: 1px;
+    margin: 8px 0;
+}
+"#;
+
+fn load_css() {
+    let provider = CssProvider::new();
+    provider.load_from_data(OVERLAY_CSS);
+
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::gdk::Display::default().expect("Could not get default display"),
+        &provider,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
