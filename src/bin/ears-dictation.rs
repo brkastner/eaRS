@@ -11,7 +11,7 @@ use ears::virtual_keyboard::{create_virtual_keyboard, VirtualKeyboard, SpecialKe
 #[cfg(feature = "preview-overlay")]
 use ears::clipboard::copy_and_paste;
 #[cfg(feature = "preview-overlay")]
-use ears::preview_overlay::{spawn_overlay, OverlayHandle, OverlayResponse, OverlayStatus};
+use ears::gtk_overlay::{spawn_overlay, OverlayHandle, OverlayResponse, OverlayStatus};
 use futures_util::{SinkExt, StreamExt};
 use notifica::notify;
 use rdev::{EventType, listen};
@@ -173,32 +173,29 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "llm-correct"))]
     let (_, final_correct_rx) = bounded::<()>(1);
 
-    // Channels for preview overlay commands (checkpoint/commit)
+    // Channels for preview overlay commands (checkpoint/commit/respawn)
     // Always created but only used when preview-overlay feature is enabled
     let (checkpoint_tx, checkpoint_rx) = bounded::<()>(1);
     let (commit_tx, commit_rx) = bounded::<()>(1);
+    let (respawn_overlay_tx, respawn_overlay_rx) = bounded::<()>(1);
 
-    // Spawn preview overlay if enabled
+    // Preview mode flag (set by --preview arg)
     #[cfg(feature = "preview-overlay")]
-    let overlay_handle: Option<OverlayHandle> = if args.preview {
-        let preview_config = &config.dictation.preview;
-        match spawn_overlay(preview_config.window_width, preview_config.window_height) {
-            Ok(handle) => {
-                eprintln!("Preview overlay spawned");
-                Some(handle)
-            }
-            Err(e) => {
-                eprintln!("Failed to spawn preview overlay: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    #[cfg(feature = "preview-overlay")]
-    let preview_mode = args.preview && overlay_handle.is_some();
+    let preview_mode = args.preview;
     #[cfg(not(feature = "preview-overlay"))]
     let preview_mode = false;
+
+    // Store preview config for respawning overlay
+    #[cfg(feature = "preview-overlay")]
+    let preview_window_width = config.dictation.preview.window_width;
+    #[cfg(feature = "preview-overlay")]
+    let preview_window_height = config.dictation.preview.window_height;
+
+    // Store paste hotkey for clipboard operations
+    #[cfg(feature = "preview-overlay")]
+    let paste_hotkey = config.dictation.preview.paste_hotkey.clone();
+    #[cfg(not(feature = "preview-overlay"))]
+    let paste_hotkey = "ctrl+v".to_string();
 
     let running_clone = running.clone();
 
@@ -211,6 +208,8 @@ async fn main() -> Result<()> {
     // SIGUSR1 toggles capturing state for external hotkey integration
     #[cfg(feature = "llm-correct")]
     let sig_final_tx = final_correct_tx.clone();
+    let sig_respawn_tx = respawn_overlay_tx.clone();
+    let sig_preview_mode = preview_mode;
     {
         let sig_capturing = capturing.clone();
         let sig_state = dictation_state.clone();
@@ -237,6 +236,10 @@ async fn main() -> Result<()> {
                 if !is_active {
                     let _ = sig_final_tx.send(());
                 }
+                // Trigger overlay respawn when toggling ON in preview mode
+                if is_active && sig_preview_mode {
+                    let _ = sig_respawn_tx.send(());
+                }
                 #[cfg(feature = "hooks")]
                 apply_state_change(&sig_state, event, &sig_notif, &sig_hooks);
                 #[cfg(not(feature = "hooks"))]
@@ -244,6 +247,24 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // SIGUSR2 triggers checkpoint (paste current buffer, continue)
+    #[cfg(feature = "preview-overlay")]
+    {
+        let sig_checkpoint_tx = checkpoint_tx.clone();
+        tokio::spawn(async move {
+            let mut sigusr2 = signal(SignalKind::user_defined2())
+                .expect("failed to register SIGUSR2 handler");
+            loop {
+                sigusr2.recv().await;
+                eprintln!("SIGUSR2: checkpoint requested");
+                let _ = sig_checkpoint_tx.send(());
+            }
+        });
+    }
+
+    // Note: Commit is triggered by pressing Enter in the focused overlay window
+    // SIGHUP is not used because it terminates the process before handler registers
 
     let hotkey_running = running.clone();
     let hotkey_capturing = capturing.clone();
@@ -327,6 +348,17 @@ async fn main() -> Result<()> {
                     EventType::KeyRelease(k) => unsafe {
                         if !*hotkey_running.lock().unwrap() {
                             return;
+                        }
+                        // Debug: log numpad and special keys to diagnose hotkey issues
+                        #[cfg(feature = "preview-overlay")]
+                        if hotkey_preview_mode {
+                            match k {
+                                rdev::Key::KpPlus | rdev::Key::KpMinus | rdev::Key::KpReturn |
+                                rdev::Key::KpMultiply | rdev::Key::KpDivide => {
+                                    eprintln!("[KEY DEBUG] Numpad key: {:?} (expected checkpoint: {:?})", k, cp_key);
+                                }
+                                _ => {}
+                            }
                         }
                         if CTRL == t_ctrl && SHIFT == t_shift && ALT == t_alt && k == t_key {
                             let mut c = hotkey_capturing.lock().unwrap();
@@ -444,6 +476,12 @@ async fn main() -> Result<()> {
                     .context("Failed to initialize virtual keyboard. \
                               On Linux/Wayland, ensure you are in the 'input' group.")?;
 
+                // Overlay handle - starts as None, spawned on first toggle
+                #[cfg(feature = "preview-overlay")]
+                let mut overlay_handle: Option<OverlayHandle> = None;
+                #[cfg(not(feature = "preview-overlay"))]
+                let overlay_handle: Option<()> = None;
+
                 #[cfg(feature = "llm-correct")]
                 let mut corrector = {
                     let ollama_url = args.ollama_url.clone()
@@ -523,6 +561,10 @@ async fn main() -> Result<()> {
                     }
                 });
 
+                // Track if we've already reported overlay closed (to avoid log spam)
+                #[cfg(feature = "preview-overlay")]
+                let mut overlay_closed_logged = false;
+
                 loop {
                     // Check for overlay responses (paste text)
                     #[cfg(feature = "preview-overlay")]
@@ -531,15 +573,24 @@ async fn main() -> Result<()> {
                             match response {
                                 OverlayResponse::PasteText(text) => {
                                     eprintln!("[PREVIEW] Pasting text: {} chars", text.len());
-                                    if let Err(e) = copy_and_paste(&text, keyboard.as_mut()) {
+                                    if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
                                         eprintln!("[PREVIEW PASTE ERROR] {}", e);
                                     }
                                 }
                                 OverlayResponse::Closed => {
-                                    eprintln!("[PREVIEW] Overlay closed");
+                                    if !overlay_closed_logged {
+                                        eprintln!("[PREVIEW] Overlay closed, will respawn on next toggle");
+                                        overlay_closed_logged = true;
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    // Set overlay_handle to None if overlay was closed (check channel disconnect)
+                    #[cfg(feature = "preview-overlay")]
+                    if overlay_closed_logged && overlay_handle.is_some() {
+                        overlay_handle = None;
                     }
 
                     select! {
@@ -554,17 +605,43 @@ async fn main() -> Result<()> {
                         recv(checkpoint_rx) -> _ => {
                             #[cfg(feature = "preview-overlay")]
                             if let Some(ref handle) = overlay_handle {
+                                // Drain any duplicate checkpoint signals
+                                while checkpoint_rx.try_recv().is_ok() {}
+                                eprintln!("[CHECKPOINT] Processing...");
                                 if let Err(e) = handle.checkpoint() {
                                     eprintln!("[CHECKPOINT ERROR] {}", e);
                                 }
                             }
                         }
-                        // Preview mode: commit (paste all, close overlay)
+                        // Preview mode: commit (paste all, close overlay, pause)
                         recv(commit_rx) -> _ => {
                             #[cfg(feature = "preview-overlay")]
                             if let Some(ref handle) = overlay_handle {
+                                // Drain any duplicate commit signals
+                                while commit_rx.try_recv().is_ok() {}
+                                eprintln!("[COMMIT] Processing...");
                                 if let Err(e) = handle.commit() {
                                     eprintln!("[COMMIT ERROR] {}", e);
+                                }
+                                // Also pause capturing
+                                *capturing.lock().unwrap() = false;
+                                eprintln!("[COMMIT] Paused capturing");
+                            }
+                        }
+                        // Respawn overlay when toggle turns on and overlay is closed
+                        recv(respawn_overlay_rx) -> _ => {
+                            #[cfg(feature = "preview-overlay")]
+                            if preview_mode && overlay_handle.is_none() {
+                                eprintln!("[PREVIEW] Respawning overlay...");
+                                match spawn_overlay(preview_window_width, preview_window_height) {
+                                    Ok(handle) => {
+                                        eprintln!("Preview overlay respawned");
+                                        overlay_handle = Some(handle);
+                                        overlay_closed_logged = false;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to respawn preview overlay: {}", e);
+                                    }
                                 }
                             }
                         }
