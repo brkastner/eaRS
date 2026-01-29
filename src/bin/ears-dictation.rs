@@ -15,6 +15,8 @@ use serde_json::Value;
 use std::fs;
 #[cfg(feature = "hooks")]
 use std::process::Command as ProcessCommand;
+#[cfg(feature = "llm-correct")]
+use std::time::Instant;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::signal::unix::{signal, SignalKind};
@@ -22,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const PID_FILE_NAME: &str = "dictation.pid";
+const STATUS_FILE_NAME: &str = "status.json";
 
 #[derive(Clone, Debug, clap::ValueEnum)]
 enum EngineArg {
@@ -91,19 +94,36 @@ struct Args {
     ollama_model: String,
 }
 
-fn get_pid_file() -> std::path::PathBuf {
-    let state_dir = if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
+fn get_state_dir() -> std::path::PathBuf {
+    if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
         if !xdg_state.is_empty() {
-            std::path::PathBuf::from(xdg_state)
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            std::path::PathBuf::from(home).join(".local/state")
+            return std::path::PathBuf::from(xdg_state).join("ears");
         }
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home).join(".local/state")
-    };
-    state_dir.join("ears").join(PID_FILE_NAME)
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".local/state/ears")
+}
+
+fn get_pid_file() -> std::path::PathBuf {
+    get_state_dir().join(PID_FILE_NAME)
+}
+
+fn get_status_file() -> std::path::PathBuf {
+    get_state_dir().join(STATUS_FILE_NAME)
+}
+
+fn write_status(state: &str) {
+    let status_file = get_status_file();
+    if let Some(parent) = status_file.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let json = format!(r#"{{"state":"{}"}}"#, state);
+    let tmp_file = status_file.with_extension("tmp");
+    if fs::write(&tmp_file, &json).is_ok() {
+        let _ = fs::rename(&tmp_file, &status_file);
+    }
 }
 
 fn write_pid_file() -> Result<()> {
@@ -321,6 +341,8 @@ async fn main() -> Result<()> {
                 };
                 #[cfg(feature = "llm-correct")]
                 let mut correction_buffer = CorrectionBuffer::new();
+                #[cfg(feature = "llm-correct")]
+                let mut last_word_time = Instant::now();
 
                 let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<WriterCommand>();
 
@@ -389,8 +411,14 @@ async fn main() -> Result<()> {
                         recv(stop_rx) -> _ => {
                             break;
                         }
-                        default => {
-                            if let Some(message) = read.next().await {
+                        default(std::time::Duration::from_millis(200)) => {
+                            // Use timeout to avoid blocking forever on websocket read
+                            let ws_result = tokio::time::timeout(
+                                std::time::Duration::from_millis(200),
+                                read.next()
+                            ).await;
+
+                            if let Ok(Some(message)) = ws_result {
                                 match message {
                                     Ok(Message::Text(text)) => {
                                         // eprintln!("[WS RECEIVED] {}", text);
@@ -400,6 +428,7 @@ async fn main() -> Result<()> {
                                                 let is_capturing = *capturing.lock().unwrap();
                                                 if is_capturing {
                                                     if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                        last_word_time = Instant::now();
                                                         if let Err(e) = handle_word_with_correction(
                                                             word,
                                                             &mut keyboard,
@@ -432,8 +461,31 @@ async fn main() -> Result<()> {
                                     }
                                     _ => {}
                                 }
-                            } else {
+                            } else if let Ok(None) = ws_result {
+                                // Stream ended
                                 break;
+                            }
+                            // Timeout case (Err) - continue to check pause detection
+
+                            // Check for 5-second pause to trigger final paragraph correction
+                            #[cfg(feature = "llm-correct")]
+                            {
+                                let is_capturing = *capturing.lock().unwrap();
+                                if is_capturing
+                                    && last_word_time.elapsed() >= std::time::Duration::from_secs(5)
+                                    && correction_buffer.paragraph_len() >= 2
+                                {
+                                    write_status("processing");
+                                    if let Err(e) = correct_final_paragraph(
+                                        &mut keyboard,
+                                        &mut correction_buffer,
+                                        &mut corrector,
+                                    ).await {
+                                        eprintln!("[PAUSE CORRECTION ERROR] {}", e);
+                                    }
+                                    write_status("listening");
+                                    last_word_time = Instant::now();
+                                }
                             }
                         }
                     }
@@ -458,6 +510,7 @@ async fn main() -> Result<()> {
     }
 
     remove_pid_file();
+    let _ = fs::remove_file(get_status_file());
     #[cfg(feature = "hooks")]
     apply_state_change(
         &dictation_state,
@@ -543,11 +596,6 @@ impl CorrectionBuffer {
             || trimmed.ends_with(',')
             || trimmed.ends_with(';')
             || self.chunk_words.len() >= self.chunk_size
-    }
-
-    fn is_paragraph_end(word: &str) -> bool {
-        let trimmed = word.trim();
-        trimmed.ends_with('.') || trimmed.ends_with('?') || trimmed.ends_with('!')
     }
 
     fn chunk_len(&self) -> usize {
@@ -696,6 +744,14 @@ fn apply_state_change(
     *guard = new_state;
     drop(guard);
 
+    // Write status for waybar integration
+    let status_str = match new_state {
+        DictationState::Listening => "listening",
+        DictationState::Suspended => "paused",
+        DictationState::Inactive => "inactive",
+    };
+    write_status(status_str);
+
     handle_toggle_side_effects(event, notifications);
 }
 
@@ -718,6 +774,14 @@ fn apply_state_change(
     }
     *guard = new_state;
     drop(guard);
+
+    // Write status for waybar integration
+    let status_str = match new_state {
+        DictationState::Listening => "listening",
+        DictationState::Suspended => "paused",
+        DictationState::Inactive => "inactive",
+    };
+    write_status(status_str);
 
     handle_toggle_side_effects(event, notifications, hooks);
 }
