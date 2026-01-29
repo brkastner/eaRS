@@ -76,6 +76,7 @@ arboard = { version = "3.4", optional = true }
 gtk4 = { version = "0.9", optional = true, features = ["v4_10"] }
 gtk4-layer-shell = { version = "0.4", optional = true }
 glib = { version = "0.20", optional = true }
+async-channel = { version = "2.3", optional = true }
 
 # Platform-specific sentencepiece configuration
 # All platforms: compile from source (static linking).
@@ -99,10 +100,10 @@ parakeet = ["dep:prkt", "dep:webrtc-vad"]
 llm-correct = ["dep:reqwest"]
 
 # Preview overlay mode (buffer-first dictation with gtk4-layer-shell)
-preview-overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib", "dep:wl-clipboard-rs", "dep:arboard", "llm-correct"]
+preview-overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib", "dep:async-channel", "dep:wl-clipboard-rs", "dep:arboard", "llm-correct"]
 
 # Standalone overlay with local STT (gtk4-layer-shell)
-overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib", "dep:wl-clipboard-rs", "dep:arboard", "parakeet", "llm-correct"]
+overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib", "dep:async-channel", "dep:wl-clipboard-rs", "dep:arboard", "parakeet", "llm-correct"]
 
 # Acceleration (shared flags)
 nvidia = ["dep:cudarc", "candle/cuda", "candle-nn/cuda", "prkt/cuda"]
