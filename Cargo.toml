@@ -98,8 +98,8 @@ parakeet = ["dep:prkt", "dep:webrtc-vad"]
 # LLM correction (requires Ollama or compatible endpoint)
 llm-correct = ["dep:reqwest"]
 
-# Preview overlay mode (buffer-first dictation with egui window)
-preview-overlay = ["dep:eframe", "dep:winit", "dep:wl-clipboard-rs", "dep:arboard", "llm-correct"]
+# Preview overlay mode (buffer-first dictation with gtk4-layer-shell)
+preview-overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib", "dep:wl-clipboard-rs", "dep:arboard", "llm-correct"]
 
 # Standalone overlay with local STT (gtk4-layer-shell)
 overlay = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:glib", "dep:wl-clipboard-rs", "dep:arboard", "parakeet", "llm-correct"]
