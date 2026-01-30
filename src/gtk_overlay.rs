@@ -21,8 +21,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 pub enum OverlayCommand {
     /// A new word arrived from STT
     Word(String),
-    /// LLM correction completed
+    /// LLM correction completed (full replacement for final paragraph correction)
     Correction(String),
+    /// Chunk correction: splice corrected words into active_words at a range
+    ChunkCorrection {
+        corrected: String,
+        start: usize,
+        original_len: usize,
+    },
     /// Checkpoint requested (paste current buffer, continue)
     Checkpoint,
     /// Commit requested (paste all, close)
@@ -77,11 +83,22 @@ impl OverlayHandle {
             .map_err(|e| anyhow::anyhow!("Failed to send word to overlay: {}", e))
     }
 
-    /// Send a correction to the overlay
+    /// Send a correction to the overlay (full replacement for final paragraph correction)
     pub fn send_correction(&self, corrected: String) -> Result<()> {
         self.command_tx
             .send_blocking(OverlayCommand::Correction(corrected))
             .map_err(|e| anyhow::anyhow!("Failed to send correction to overlay: {}", e))
+    }
+
+    /// Send a chunk correction that splices corrected words into a range of active_words
+    pub fn send_chunk_correction(&self, corrected: &str, start: usize, original_len: usize) -> Result<()> {
+        self.command_tx
+            .send_blocking(OverlayCommand::ChunkCorrection {
+                corrected: corrected.to_string(),
+                start,
+                original_len,
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to send chunk correction to overlay: {}", e))
     }
 
     /// Request a checkpoint (paste and continue)
@@ -352,6 +369,10 @@ fn build_window(
                     state.buffer.apply_correction(corrected);
                     state.update_display();
                 }
+                OverlayCommand::ChunkCorrection { corrected, start, original_len } => {
+                    state.buffer.apply_chunk_correction(start, original_len, &corrected);
+                    state.update_display();
+                }
                 OverlayCommand::Checkpoint => {
                     if let Some(text) = state.buffer.checkpoint() {
                         let _ = state.response_tx.send(OverlayResponse::PasteText(text));
@@ -363,11 +384,13 @@ fn build_window(
                         let _ = state.response_tx.send(OverlayResponse::PasteText(text));
                     }
                     let _ = state.response_tx.send(OverlayResponse::Closed);
+                    drop(state);
                     window_clone.close();
                     break;
                 }
                 OverlayCommand::Close => {
                     let _ = state.response_tx.send(OverlayResponse::Closed);
+                    drop(state);
                     window_clone.close();
                     break;
                 }
@@ -406,6 +429,7 @@ pub fn spawn_overlay(window_width: u32, window_height: u32) -> Result<OverlayHan
         // Check if layer-shell is supported (must be done after GTK init)
         let app = Application::builder()
             .application_id("com.ears.dictation.overlay")
+            .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
             .build();
 
         // Store command_rx in a RefCell to transfer into the activate callback

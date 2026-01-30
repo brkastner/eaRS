@@ -181,6 +181,7 @@ async fn main() -> Result<()> {
     let (checkpoint_tx, checkpoint_rx) = bounded::<()>(1);
     let (commit_tx, commit_rx) = bounded::<()>(1);
     let (respawn_overlay_tx, respawn_overlay_rx) = bounded::<()>(1);
+    let (discard_tx, discard_rx) = bounded::<()>(1);
 
     // Preview mode flag (set by --preview arg)
     #[cfg(feature = "preview-overlay")]
@@ -262,6 +263,21 @@ async fn main() -> Result<()> {
                 sigusr2.recv().await;
                 eprintln!("SIGUSR2: checkpoint requested");
                 let _ = sig_checkpoint_tx.send(());
+            }
+        });
+    }
+
+    // SIGRTMIN discards overlay session (close without paste, reset buffers)
+    #[cfg(feature = "preview-overlay")]
+    {
+        let sig_discard_tx = discard_tx.clone();
+        tokio::spawn(async move {
+            let mut sigrtmin = signal(SignalKind::from_raw(libc::SIGRTMIN()))
+                .expect("failed to register SIGRTMIN handler");
+            loop {
+                sigrtmin.recv().await;
+                eprintln!("SIGRTMIN: discard overlay session");
+                let _ = sig_discard_tx.send(());
             }
         });
     }
@@ -501,6 +517,9 @@ async fn main() -> Result<()> {
                 let mut correction_buffer = CorrectionBuffer::new();
                 #[cfg(feature = "llm-correct")]
                 let mut last_word_time = Instant::now();
+                // Track how many words have been sent to the overlay since last checkpoint/commit
+                #[cfg(all(feature = "llm-correct", feature = "preview-overlay"))]
+                let mut overlay_word_count: usize = 0;
 
                 let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<WriterCommand>();
 
@@ -569,10 +588,10 @@ async fn main() -> Result<()> {
                 let mut overlay_closed_logged = false;
 
                 loop {
-                    // Check for overlay responses (paste text)
+                    // Drain all overlay responses (paste text, closed)
                     #[cfg(feature = "preview-overlay")]
                     if let Some(ref handle) = overlay_handle {
-                        if let Some(response) = handle.try_recv() {
+                        while let Some(response) = handle.try_recv() {
                             match response {
                                 OverlayResponse::PasteText(text) => {
                                     eprintln!("[PREVIEW] Pasting text: {} chars", text.len());
@@ -611,8 +630,43 @@ async fn main() -> Result<()> {
                                 // Drain any duplicate checkpoint signals
                                 while checkpoint_rx.try_recv().is_ok() {}
                                 eprintln!("[CHECKPOINT] Processing...");
+
+                                // Drain in-flight words from WebSocket before checkpointing
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                loop {
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_millis(100),
+                                        read.next()
+                                    ).await {
+                                        Ok(Some(Ok(Message::Text(text)))) => {
+                                            if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                    let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                    if !word.is_empty() && has_alphanumeric {
+                                                        let _ = handle.send_word(word.to_string());
+                                                        #[cfg(feature = "llm-correct")]
+                                                        {
+                                                            correction_buffer.add_word(word);
+                                                            overlay_word_count += 1;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+
                                 if let Err(e) = handle.checkpoint() {
                                     eprintln!("[CHECKPOINT ERROR] {}", e);
+                                }
+                                // Reset correction state — checkpointed text is pasted, start fresh
+                                // Must clear paragraph too, otherwise auto-commit re-pastes
+                                // the checkpointed text from committed_sections
+                                #[cfg(feature = "llm-correct")]
+                                {
+                                    correction_buffer.take_paragraph();
+                                    overlay_word_count = 0;
                                 }
                             }
                         }
@@ -626,6 +680,8 @@ async fn main() -> Result<()> {
                                 if let Err(e) = handle.commit() {
                                     eprintln!("[COMMIT ERROR] {}", e);
                                 }
+                                #[cfg(feature = "llm-correct")]
+                                { overlay_word_count = 0; }
                                 // Also pause capturing
                                 *capturing.lock().unwrap() = false;
                                 eprintln!("[COMMIT] Paused capturing");
@@ -646,6 +702,23 @@ async fn main() -> Result<()> {
                                         eprintln!("Failed to respawn preview overlay: {}", e);
                                     }
                                 }
+                            }
+                        }
+                        // Discard overlay session (close without paste, reset)
+                        recv(discard_rx) -> _ => {
+                            #[cfg(feature = "preview-overlay")]
+                            if let Some(ref handle) = overlay_handle {
+                                while discard_rx.try_recv().is_ok() {}
+                                eprintln!("[DISCARD] Closing overlay without paste");
+                                let _ = handle.close();
+                                #[cfg(feature = "llm-correct")]
+                                {
+                                    correction_buffer.reset_chunk();
+                                    correction_buffer.take_paragraph(); // drain paragraph too
+                                    overlay_word_count = 0;
+                                }
+                                *capturing.lock().unwrap() = false;
+                                write_status("paused");
                             }
                         }
                         // Trigger final correction when capture is toggled off
@@ -673,6 +746,7 @@ async fn main() -> Result<()> {
                                                                 let _ = handle.send_word(word.to_string());
                                                             }
                                                             correction_buffer.add_word(word);
+                                                            overlay_word_count += 1;
                                                         }
                                                     }
                                                 }
@@ -703,6 +777,7 @@ async fn main() -> Result<()> {
                                         eprintln!("[TOGGLE-OFF] Committing overlay");
                                         let _ = handle.commit();
                                     }
+                                    overlay_word_count = 0;
                                     write_status("paused");
                                 }
 
@@ -808,7 +883,10 @@ async fn main() -> Result<()> {
                                                                 }
                                                                 // Also add to correction buffer for LLM correction
                                                                 #[cfg(feature = "llm-correct")]
-                                                                correction_buffer.add_word(word);
+                                                                {
+                                                                    correction_buffer.add_word(word);
+                                                                    overlay_word_count += 1;
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -899,23 +977,62 @@ async fn main() -> Result<()> {
                                         && correction_buffer.chunk_len() >= 2
                                     {
                                         // 1.5+ second pause: chunk correction for preview
-                                        let (original, _word_count, _original_words) = correction_buffer.take_chunk();
+                                        let (original, word_count, original_words) = correction_buffer.take_chunk();
+                                        let chunk_start = overlay_word_count.saturating_sub(word_count);
                                         if let Some(ref handle) = overlay_handle {
                                             let _ = handle.set_status(OverlayStatus::Correcting);
                                         }
                                         write_status("processing");
-                                        match corrector.correct_sentence(&original).await {
-                                            Ok(corrected) if corrected != original => {
-                                                eprintln!("[PREVIEW CHUNK] '{}' -> '{}'", original, corrected);
-                                                if let Some(ref handle) = overlay_handle {
-                                                    if let Err(e) = handle.send_correction(corrected) {
-                                                        eprintln!("[PREVIEW CORRECTION ERROR] {}", e);
+
+                                        // Run correction concurrently with word reading so
+                                        // words arriving during the Ollama roundtrip still
+                                        // flow to the overlay and correction buffer.
+                                        let correction_fut = corrector.correct_sentence(&original);
+                                        tokio::pin!(correction_fut);
+                                        let mut correction_result = None;
+
+                                        loop {
+                                            tokio::select! {
+                                                result = &mut correction_fut => {
+                                                    correction_result = Some(result);
+                                                    break;
+                                                }
+                                                msg = read.next() => {
+                                                    if let Some(Ok(Message::Text(text))) = msg {
+                                                        if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                            if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                                let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                                if !word.is_empty() && has_alphanumeric {
+                                                                    last_word_time = Instant::now();
+                                                                    if let Some(ref handle) = overlay_handle {
+                                                                        let _ = handle.send_word(word.to_string());
+                                                                    }
+                                                                    correction_buffer.add_word(word);
+                                                                    overlay_word_count += 1;
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
-                                            Ok(_) => {}
-                                            Err(e) => eprintln!("[PREVIEW CHUNK ERROR] {}", e),
                                         }
+
+                                        // Apply correction result
+                                        if let Some(Ok(corrected)) = correction_result {
+                                            if corrected != original {
+                                                eprintln!("[PREVIEW CHUNK] '{}' -> '{}'", original, corrected);
+                                                if let Some(ref handle) = overlay_handle {
+                                                    if let Err(e) = handle.send_chunk_correction(&corrected, chunk_start, word_count) {
+                                                        eprintln!("[PREVIEW CORRECTION ERROR] {}", e);
+                                                    }
+                                                }
+                                                // Keep paragraph_words in sync with corrected text
+                                                correction_buffer.apply_chunk_correction(&original_words, &corrected);
+                                            }
+                                        } else if let Some(Err(e)) = correction_result {
+                                            eprintln!("[PREVIEW CHUNK ERROR] {}", e);
+                                        }
+
                                         if let Some(ref handle) = overlay_handle {
                                             let _ = handle.set_status(OverlayStatus::Listening);
                                         }
@@ -936,6 +1053,7 @@ async fn main() -> Result<()> {
                                         if let Some(ref handle) = overlay_handle {
                                             let _ = handle.commit();
                                         }
+                                        overlay_word_count = 0;
                                         *capturing.lock().unwrap() = false;
                                     }
                                 } else {
@@ -1136,6 +1254,11 @@ impl CorrectionBuffer {
 
     fn paragraph_len(&self) -> usize {
         self.paragraph_words.len()
+    }
+
+    fn reset_chunk(&mut self) {
+        self.chunk_words.clear();
+        self.chunk_char_count = 0;
     }
 
     /// Update paragraph after a chunk correction to reflect what's actually on screen

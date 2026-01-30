@@ -598,6 +598,10 @@ overlay-status:
 overlay-stop:
     systemctl --user stop ears-dictation-remote
 
+# Build, install, stop service, and run directly in foreground for testing
+overlay-test: overlay-build overlay-stop overlay-install
+    ears-dictation --server ws://localhost:8765 --ollama-url http://localhost:11434 --preview
+
 # === Maintenance ===
 
 # Clean build artifacts

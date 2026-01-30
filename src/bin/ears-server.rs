@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use ears::{TranscriptionOptions, config::AppConfig, server};
 use ears::server::EngineKind;
+use std::path::PathBuf;
 #[cfg(feature = "parakeet")]
 use ears::server::ParakeetDevice;
 #[derive(Clone, Debug, ValueEnum)]

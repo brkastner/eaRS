@@ -58,10 +58,25 @@ impl PreviewBuffer {
             .unwrap_or_else(|| self.active_text())
     }
 
-    /// Apply an LLM correction to the active buffer
+    /// Apply an LLM correction to the active buffer (full replacement for final correction)
     pub fn apply_correction(&mut self, corrected: String) {
         self.corrected_active = Some(corrected);
         self.correction_pending = false;
+    }
+
+    /// Apply a chunk correction by splicing corrected words into active_words
+    ///
+    /// `start` is the index of the first word in the chunk within active_words.
+    /// `original_len` is the number of words the chunk originally contained.
+    /// Words added after the chunk (during correction) are preserved.
+    pub fn apply_chunk_correction(&mut self, start: usize, original_len: usize, corrected: &str) {
+        let corrected_words: Vec<String> = corrected.split_whitespace().map(String::from).collect();
+        let end = (start + original_len).min(self.active_words.len());
+        if start <= end && start <= self.active_words.len() {
+            self.active_words.splice(start..end, corrected_words);
+        }
+        // Clear corrected_active — active_words now reflects corrections directly
+        self.corrected_active = None;
     }
 
     /// Mark that a correction is in progress
@@ -229,5 +244,45 @@ mod tests {
         let text = buffer.commit();
         assert_eq!(text, Some("first\n\nsecond".to_string()));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_correction_no_new_words() {
+        let mut buffer = PreviewBuffer::new();
+        for w in ["hello", "wrold", "foo", "bar"] {
+            buffer.add_word(w.to_string());
+        }
+        // Correct last 2 words (chunk at index 2, len 2)
+        buffer.apply_chunk_correction(2, 2, "foo bar");
+        assert_eq!(buffer.active_text(), "hello wrold foo bar");
+    }
+
+    #[test]
+    fn test_chunk_correction_with_new_words() {
+        let mut buffer = PreviewBuffer::new();
+        // Original 4 words
+        for w in ["hello", "wrold", "foo", "bar"] {
+            buffer.add_word(w.to_string());
+        }
+        // Simulate: chunk was last 2 words, but 2 new words arrived during correction
+        buffer.add_word("baz".to_string());
+        buffer.add_word("qux".to_string());
+        // Now active_words = [hello, wrold, foo, bar, baz, qux]
+        // Correct chunk at index 2 (foo, bar) → "Foo Bar"
+        buffer.apply_chunk_correction(2, 2, "Foo Bar");
+        // Should preserve baz, qux after the corrected chunk
+        assert_eq!(buffer.active_text(), "hello wrold Foo Bar baz qux");
+    }
+
+    #[test]
+    fn test_chunk_correction_changes_word_count() {
+        let mut buffer = PreviewBuffer::new();
+        for w in ["i", "can", "not", "go"] {
+            buffer.add_word(w.to_string());
+        }
+        // Correct "can not" (index 1, len 2) → "cannot" (1 word)
+        buffer.apply_chunk_correction(1, 2, "cannot");
+        assert_eq!(buffer.active_text(), "i cannot go");
+        assert_eq!(buffer.active_word_count(), 3);
     }
 }
