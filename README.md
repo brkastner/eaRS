@@ -343,38 +343,12 @@ Helper script:
 
 The script reads `./.env` if present and exports the `EARS_OLLAMA_*` variables.
 
-Profile toggle script:
+Profile toggle script lives in the asr-gateway repo:
 
 ```bash
-./scripts/toggle-dictation-profile.sh --journal
-./scripts/toggle-dictation-profile.sh --technical
-./scripts/toggle-dictation-profile.sh   # toggles between profiles
-./scripts/toggle-dictation-profile.sh --shutdown
-```
-
-Gateway auto-start (default):
-
-- If `EARS_SERVER_URL` points to `127.0.0.1:8770/8771/8772`, the script will try to
-  start `asr-gateway` using `just` from `$HOME/dev/asr-gateway`.
-- Disable with `--no-gateway-autostart`.
-
-ears-server auto-start (default):
-
-- If the upstream server URL is local, the script will start `ears server start`.
-- Override with:
-  - `EARS_SERVER_BIN` (default `$ROOT/target/release/ears`)
-  - `EARS_SERVER_ENGINE` (default `parakeet`)
-  - `EARS_SERVER_DEVICE` (default `amd`)
-  - `EARS_SERVER_BIND` (default `0.0.0.0:<upstream-port>`)
-- Disable with `--no-ears-server-autostart`.
-
-Ollama helpers:
-
-```bash
-./scripts/toggle-dictation-profile.sh --journal --only
-./scripts/toggle-dictation-profile.sh --technical --only
-./scripts/toggle-dictation-profile.sh --only --no-preload
-./scripts/toggle-dictation-profile.sh --technical --ollama-model qwen2.5:32b-16k
+/home/kas/dev/asr-gateway/scripts/toggle-dictation-profile.sh --journal --only
+/home/kas/dev/asr-gateway/scripts/toggle-dictation-profile.sh --technical --only
+/home/kas/dev/asr-gateway/scripts/toggle-dictation-profile.sh --shutdown
 ```
 
 ## Configuration
