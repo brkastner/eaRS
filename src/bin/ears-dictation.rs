@@ -905,14 +905,18 @@ async fn main() -> Result<()> {
                             #[cfg(feature = "llm-correct")]
                             {
                                 // Small delay to allow any in-flight words to arrive
-                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                let grace_ms = args.capture_grace_ms.saturating_add(200);
+                                let delay_ms = if grace_ms > 300 { grace_ms } else { 300 };
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
                                 // Preview mode: drain words to overlay, run final correction, then commit
                                 #[cfg(feature = "preview-overlay")]
                                 if preview_mode {
                                     // Drain any remaining words to overlay
                                     let drain_deadline = Instant::now()
-                                        + std::time::Duration::from_millis(800);
+                                        + std::time::Duration::from_millis(
+                                            args.capture_grace_ms.saturating_add(600),
+                                        );
                                     loop {
                                         match tokio::time::timeout(
                                             std::time::Duration::from_millis(120),
@@ -995,7 +999,9 @@ async fn main() -> Result<()> {
                                 if !preview_mode {
                                     // Drain any remaining words from websocket
                                     let drain_deadline = Instant::now()
-                                        + std::time::Duration::from_millis(800);
+                                        + std::time::Duration::from_millis(
+                                            args.capture_grace_ms.saturating_add(600),
+                                        );
                                     loop {
                                         match tokio::time::timeout(
                                             std::time::Duration::from_millis(120),
