@@ -207,6 +207,14 @@ struct Args {
     )]
     chord_delay_ms: u64,
 
+    #[arg(
+        long,
+        env = "EARS_CAPTURE_GRACE_MS",
+        default_value_t = 500,
+        help = "Grace period to keep capturing after toggle-off (milliseconds)"
+    )]
+    capture_grace_ms: u64,
+
     #[cfg(feature = "preview-overlay")]
     #[arg(
         long,
@@ -274,6 +282,7 @@ async fn main() -> Result<()> {
 
     let running = Arc::new(Mutex::new(true));
     let capturing = Arc::new(Mutex::new(false));
+    let capture_grace_until = Arc::new(Mutex::new(None::<Instant>));
     let dictation_state = Arc::new(Mutex::new(DictationState::Inactive));
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
@@ -323,6 +332,8 @@ async fn main() -> Result<()> {
     let sig_preview_mode = preview_mode;
     {
         let sig_capturing = capturing.clone();
+        let sig_grace = capture_grace_until.clone();
+        let sig_grace_ms = args.capture_grace_ms;
         let sig_state = dictation_state.clone();
         let sig_notif = config.dictation.notifications.clone();
         #[cfg(feature = "hooks")]
@@ -335,6 +346,13 @@ async fn main() -> Result<()> {
                 let mut c = sig_capturing.lock().unwrap();
                 *c = !*c;
                 let is_active = *c;
+                if is_active {
+                    let mut grace = sig_grace.lock().unwrap();
+                    *grace = None;
+                } else {
+                    let mut grace = sig_grace.lock().unwrap();
+                    *grace = Some(Instant::now() + Duration::from_millis(sig_grace_ms));
+                }
                 eprintln!("SIGUSR1: audio capture {}", if is_active { "started" } else { "stopped" });
                 drop(c);
                 let event = if is_active {
@@ -392,8 +410,10 @@ async fn main() -> Result<()> {
     // Note: Commit is triggered by pressing Enter in the focused overlay window
     // SIGHUP is not used because it terminates the process before handler registers
 
-    let hotkey_running = running.clone();
-    let hotkey_capturing = capturing.clone();
+            let hotkey_running = running.clone();
+            let hotkey_capturing = capturing.clone();
+            let hotkey_grace = capture_grace_until.clone();
+            let hotkey_grace_ms = args.capture_grace_ms;
     let hotkey_config = config.hotkeys.clone();
     let notification_config = config.dictation.notifications.clone();
     #[cfg(feature = "hooks")]
@@ -490,6 +510,13 @@ async fn main() -> Result<()> {
                             let mut c = hotkey_capturing.lock().unwrap();
                             *c = !*c;
                             let is_active = *c;
+                            if is_active {
+                                let mut grace = hotkey_grace.lock().unwrap();
+                                *grace = None;
+                            } else {
+                                let mut grace = hotkey_grace.lock().unwrap();
+                                *grace = Some(Instant::now() + Duration::from_millis(hotkey_grace_ms));
+                            }
                             eprintln!(
                                 "Audio capture {}",
                                 if is_active { "started" } else { "stopped" }
@@ -680,9 +707,29 @@ async fn main() -> Result<()> {
                 let audio_writer = writer_tx.clone();
                 let audio_rx_clone = audio_rx.clone();
                 let audio_capturing = capturing.clone();
+                let audio_grace = capture_grace_until.clone();
                 thread::spawn(move || {
                     while let Ok(chunk) = audio_rx_clone.recv() {
-                        if *audio_capturing.lock().unwrap() {
+                        let should_send = {
+                            let is_capturing = *audio_capturing.lock().unwrap();
+                            if is_capturing {
+                                true
+                            } else {
+                                let mut grace = audio_grace.lock().unwrap();
+                                if let Some(until) = *grace {
+                                    if Instant::now() <= until {
+                                        true
+                                    } else {
+                                        *grace = None;
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+
+                        if should_send {
                             if audio_writer
                                 .send(WriterCommand::Audio(encode_chunk(&chunk)))
                                 .is_err()

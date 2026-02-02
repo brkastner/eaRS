@@ -334,6 +334,7 @@ Typing delay controls (for apps that drop fast input):
 - `EARS_BACKSPACE_DELAY_MS` (default `15`)
 - `EARS_DELETE_WORD_DELAY_MS` (default `10`)
 - `EARS_CHORD_DELAY_MS` (default `5`)
+- `EARS_CAPTURE_GRACE_MS` (default `500`, keeps audio flowing briefly after toggle-off)
 
 Helper script:
 
