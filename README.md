@@ -349,6 +349,7 @@ Profile toggle script:
 ./scripts/toggle-dictation-profile.sh --journal
 ./scripts/toggle-dictation-profile.sh --technical
 ./scripts/toggle-dictation-profile.sh   # toggles between profiles
+./scripts/toggle-dictation-profile.sh --shutdown
 ```
 
 Gateway auto-start (default):

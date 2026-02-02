@@ -24,6 +24,7 @@ Options:
   --only                      Use one model per profile (journal/technical).
   --no-gateway-autostart       Disable gateway auto-start.
   --no-ears-server-autostart   Disable ears-server auto-start.
+  --shutdown                   Stop dictation, gateway, ears-server, and unload ollama.
   -h, --help                  Show this help.
 
 If no profile is provided, the script toggles between journal and technical.
@@ -32,6 +33,7 @@ EOF
 
 profile_arg=""
 action="toggle"
+shutdown=false
 pass_args=()
 ollama_autostart=true
 ollama_preload=true
@@ -59,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --status)
       action="status"
+      shift
+      ;;
+    --shutdown)
+      shutdown=true
       shift
       ;;
     --no-ollama-autostart)
@@ -123,6 +129,37 @@ fi
 
 if [[ "$action" == "status" ]]; then
   echo "$current_profile"
+  exit 0
+fi
+
+if $shutdown; then
+  if [[ -f "$PID_FILE" ]]; then
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      sleep 0.2
+    fi
+  fi
+
+  gateway_dir="${ASR_GATEWAY_DIR:-$HOME/dev/asr-gateway}"
+  if [[ -d "$gateway_dir" ]] && command -v just >/dev/null 2>&1; then
+    (cd "$gateway_dir" && just stop-all) || true
+  fi
+
+  if [[ -x "${EARS_SERVER_BIN:-$ROOT/target/release/ears}" ]]; then
+    "${EARS_SERVER_BIN:-$ROOT/target/release/ears}" server stop >/dev/null 2>&1 || true
+  fi
+
+  if command -v ollama >/dev/null 2>&1; then
+    ollama stop "${EARS_OLLAMA_MODEL_FAST:-}" >/dev/null 2>&1 || true
+    ollama stop "${EARS_OLLAMA_MODEL_FINAL:-}" >/dev/null 2>&1 || true
+    ollama stop "${EARS_OLLAMA_MODEL_JOURNAL:-}" >/dev/null 2>&1 || true
+    ollama stop "${EARS_OLLAMA_MODEL_TECHNICAL:-}" >/dev/null 2>&1 || true
+    ollama stop "qwen2.5:7b" >/dev/null 2>&1 || true
+    ollama stop "qwen2.5:32b-16k" >/dev/null 2>&1 || true
+  fi
+
+  echo "shutdown complete"
   exit 0
 fi
 
