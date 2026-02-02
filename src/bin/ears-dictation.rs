@@ -1368,14 +1368,15 @@ struct CorrectionBuffer {
     /// Words per chunk before triggering correction
     chunk_size: usize,
     correct_on_commas: bool,
+    enable_chunk_correction: bool,
 }
 
 #[cfg(feature = "llm-correct")]
 impl CorrectionBuffer {
     fn new(profile: CorrectionProfile) -> Self {
-        let (chunk_size, correct_on_commas) = match profile {
-            CorrectionProfile::Journal => (6, true),
-            CorrectionProfile::Technical => (10, false),
+        let (chunk_size, correct_on_commas, enable_chunk_correction) = match profile {
+            CorrectionProfile::Journal => (6, true, false),
+            CorrectionProfile::Technical => (10, false, true),
         };
         Self {
             chunk_words: Vec::new(),
@@ -1384,16 +1385,19 @@ impl CorrectionBuffer {
             paragraph_char_count: 0,
             chunk_size,
             correct_on_commas,
+            enable_chunk_correction,
         }
     }
 
     fn add_word(&mut self, word: &str) {
-        // Add to chunk
-        if !self.chunk_words.is_empty() {
-            self.chunk_char_count += 1; // space
+        // Add to chunk (if enabled)
+        if self.enable_chunk_correction {
+            if !self.chunk_words.is_empty() {
+                self.chunk_char_count += 1; // space
+            }
+            self.chunk_char_count += word.len();
+            self.chunk_words.push(word.to_string());
         }
-        self.chunk_char_count += word.len();
-        self.chunk_words.push(word.to_string());
 
         // Add to paragraph
         if !self.paragraph_words.is_empty() {
@@ -1424,6 +1428,9 @@ impl CorrectionBuffer {
     }
 
     fn should_correct_chunk(&self, word: &str) -> bool {
+        if !self.enable_chunk_correction {
+            return false;
+        }
         let trimmed = word.trim();
         // Correct on: sentence end, comma, semicolon, or chunk size reached
         let ends_sentence = trimmed.ends_with('.')
@@ -1435,7 +1442,11 @@ impl CorrectionBuffer {
     }
 
     fn chunk_len(&self) -> usize {
-        self.chunk_words.len()
+        if self.enable_chunk_correction {
+            self.chunk_words.len()
+        } else {
+            0
+        }
     }
 
     fn paragraph_len(&self) -> usize {
@@ -1503,8 +1514,11 @@ fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfil
     let original_len = original_words.len();
     let corrected_len = corrected_words.len();
 
-    let max_ratio = 1.5;
-    let min_ratio = 0.5;
+    let (min_ratio, max_ratio, base_threshold) = match profile {
+        CorrectionProfile::Journal => (0.8, 1.2, 0.85),
+        CorrectionProfile::Technical => (0.9, 1.1, 0.9),
+    };
+
     let len_ratio = corrected_len as f32 / original_len as f32;
     if len_ratio > max_ratio || len_ratio < min_ratio {
         return false;
@@ -1515,12 +1529,7 @@ fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfil
     let overlap = original_set.intersection(&corrected_set).count();
     let overlap_ratio = overlap as f32 / original_set.len() as f32;
 
-    let base_threshold = match profile {
-        CorrectionProfile::Journal => 0.7,
-        CorrectionProfile::Technical => 0.85,
-    };
-
-    let threshold = if original_set.len() <= 3 { 0.5 } else { base_threshold };
+    let threshold = if original_set.len() <= 3 { 0.6 } else { base_threshold };
     overlap_ratio >= threshold
 }
 
