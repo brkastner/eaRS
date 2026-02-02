@@ -324,7 +324,12 @@ async fn main() -> Result<()> {
     let capturing = Arc::new(Mutex::new(false));
     let capture_grace_until = Arc::new(Mutex::new(None::<Instant>));
     let accuracy_buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-    let accuracy_max_samples = (args.accuracy_max_seconds as usize) * 24_000;
+    let accuracy_enabled = !args.accuracy_url.trim().is_empty();
+    let accuracy_max_samples = if accuracy_enabled {
+        (args.accuracy_max_seconds as usize) * 24_000
+    } else {
+        0
+    };
     let dictation_state = Arc::new(Mutex::new(DictationState::Inactive));
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
