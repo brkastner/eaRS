@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ROOT/.env"
+  set +a
+fi
+
+EARS_DICTATION_BIN="${EARS_DICTATION_BIN:-$ROOT/target/release/ears-dictation}"
+
+EARS_SERVER_URL="${EARS_SERVER_URL:-ws://127.0.0.1:8770/ws}"
+EARS_OLLAMA_URL="${EARS_OLLAMA_URL:-http://127.0.0.1:11434}"
+EARS_OLLAMA_MODEL_FAST="${EARS_OLLAMA_MODEL_FAST:-qwen2.5:7b}"
+EARS_OLLAMA_MODEL_FINAL="${EARS_OLLAMA_MODEL_FINAL:-qwen2.5:32b-16k}"
+EARS_OLLAMA_NUM_PREDICT_FAST="${EARS_OLLAMA_NUM_PREDICT_FAST:-128}"
+EARS_OLLAMA_NUM_PREDICT_FINAL="${EARS_OLLAMA_NUM_PREDICT_FINAL:-512}"
+
+export EARS_SERVER_URL
+export EARS_OLLAMA_URL
+export EARS_OLLAMA_MODEL_FAST
+export EARS_OLLAMA_MODEL_FINAL
+export EARS_OLLAMA_NUM_PREDICT_FAST
+export EARS_OLLAMA_NUM_PREDICT_FINAL
+
+exec "$EARS_DICTATION_BIN" --server "$EARS_SERVER_URL" "$@"

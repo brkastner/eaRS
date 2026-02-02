@@ -13,18 +13,30 @@ use std::time::Duration;
 pub struct LlmCorrectConfig {
     /// Ollama API endpoint (default: http://localhost:11434)
     pub endpoint: String,
-    /// Model to use for correction (default: qwen2.5:7b)
+    /// Model to use for fast, live correction (default: qwen2.5:14b)
     pub model: String,
+    /// Model to use for final paragraph correction (default: same as model)
+    pub final_model: String,
     /// Request timeout in seconds
     pub timeout_secs: u64,
+    /// Max tokens for fast correction
+    pub num_predict_fast: i32,
+    /// Max tokens for final correction
+    pub num_predict_final: i32,
+    /// Sampling temperature
+    pub temperature: f32,
 }
 
 impl Default for LlmCorrectConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://localhost:11434".to_string(),
-            model: "qwen2.5:7b".to_string(),
+            model: "qwen2.5:14b".to_string(),
+            final_model: "qwen2.5:14b".to_string(),
             timeout_secs: 10,
+            num_predict_fast: 128,
+            num_predict_final: 512,
+            temperature: 0.1,
         }
     }
 }
@@ -137,13 +149,14 @@ impl SentenceCorrector {
     /// Send a chunk to the LLM for correction
     pub async fn correct_sentence(&self, sentence: &str) -> Result<String> {
         let prompt = format!(
-            r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
+            r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Preserve code identifiers, file paths, flags, and casing. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
 
 Text: {}"#,
             sentence
         );
 
-        self.call_ollama(&prompt).await
+        self.call_ollama(&prompt, &self.config.model, self.config.num_predict_fast)
+            .await
     }
 
     /// Final paragraph correction with more thorough cleanup
@@ -154,25 +167,29 @@ Text: {}"#,
 - Grammar and punctuation
 - Remove filler words (uh, um)
 - Fix sentence boundaries
-IMPORTANT: Preserve all line breaks and paragraph structure exactly.
+IMPORTANT: Preserve code identifiers, file paths, flags, and casing. Preserve all line breaks and paragraph structure exactly.
 Output ONLY the corrected text, preserving meaning.
 
 Text: {}"#,
             paragraph
         );
 
-        self.call_ollama(&prompt).await
+        self.call_ollama(
+            &prompt,
+            &self.config.final_model,
+            self.config.num_predict_final,
+        )
+        .await
     }
 
-    async fn call_ollama(&self, prompt: &str) -> Result<String> {
-
+    async fn call_ollama(&self, prompt: &str, model: &str, num_predict: i32) -> Result<String> {
         let request = OllamaRequest {
-            model: &self.config.model,
+            model,
             prompt: &prompt,
             stream: false,
             options: OllamaOptions {
-                temperature: 0.1,
-                num_predict: 256,
+                temperature: self.config.temperature,
+                num_predict,
             },
         };
 

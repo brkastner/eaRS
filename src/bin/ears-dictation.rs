@@ -95,10 +95,44 @@ struct Args {
     #[arg(
         long,
         env = "EARS_OLLAMA_MODEL",
-        default_value = "qwen2.5:7b",
+        default_value = "qwen2.5:14b",
         help = "Ollama model for text correction"
     )]
     ollama_model: String,
+
+    #[cfg(feature = "llm-correct")]
+    #[arg(
+        long,
+        env = "EARS_OLLAMA_MODEL_FAST",
+        help = "Ollama model for fast, live correction"
+    )]
+    ollama_model_fast: Option<String>,
+
+    #[cfg(feature = "llm-correct")]
+    #[arg(
+        long,
+        env = "EARS_OLLAMA_MODEL_FINAL",
+        help = "Ollama model for final paragraph correction"
+    )]
+    ollama_model_final: Option<String>,
+
+    #[cfg(feature = "llm-correct")]
+    #[arg(
+        long,
+        env = "EARS_OLLAMA_NUM_PREDICT_FAST",
+        default_value_t = 128,
+        help = "Max tokens for fast correction"
+    )]
+    ollama_num_predict_fast: i32,
+
+    #[cfg(feature = "llm-correct")]
+    #[arg(
+        long,
+        env = "EARS_OLLAMA_NUM_PREDICT_FINAL",
+        default_value_t = 512,
+        help = "Max tokens for final correction"
+    )]
+    ollama_num_predict_final: i32,
 
     #[cfg(feature = "preview-overlay")]
     #[arg(
@@ -505,12 +539,29 @@ async fn main() -> Result<()> {
                 let mut corrector = {
                     let ollama_url = args.ollama_url.clone()
                         .unwrap_or_else(|| "http://localhost:11434".to_string());
+                    let fast_model = args
+                        .ollama_model_fast
+                        .clone()
+                        .unwrap_or_else(|| args.ollama_model.clone());
+                    let final_model = args
+                        .ollama_model_final
+                        .clone()
+                        .unwrap_or_else(|| args.ollama_model.clone());
                     let config = LlmCorrectConfig {
                         endpoint: ollama_url.clone(),
-                        model: args.ollama_model.clone(),
+                        model: fast_model,
+                        final_model,
                         timeout_secs: 10,
+                        num_predict_fast: args.ollama_num_predict_fast,
+                        num_predict_final: args.ollama_num_predict_final,
+                        temperature: 0.1,
                     };
-                    eprintln!("LLM correction enabled: {} ({})", config.model, ollama_url);
+                    eprintln!(
+                        "LLM correction enabled: live={} final={} ({})",
+                        config.model,
+                        config.final_model,
+                        ollama_url
+                    );
                     SentenceCorrector::new(config)?
                 };
                 #[cfg(feature = "llm-correct")]
@@ -761,7 +812,7 @@ async fn main() -> Result<()> {
                                         }
                                         write_status("processing");
                                         let (paragraph, _word_count) = correction_buffer.take_paragraph();
-                                        match corrector.correct_sentence(&paragraph).await {
+                                        match corrector.correct_paragraph(&paragraph).await {
                                             Ok(corrected) if corrected != paragraph => {
                                                 eprintln!("[TOGGLE-OFF FINAL] '{}' -> '{}'", paragraph, corrected);
                                                 if let Some(ref handle) = overlay_handle {
@@ -776,7 +827,27 @@ async fn main() -> Result<()> {
                                     if let Some(ref handle) = overlay_handle {
                                         eprintln!("[TOGGLE-OFF] Committing overlay");
                                         let _ = handle.commit();
+                                        // Wait for overlay to fully close so respawn works
+                                        loop {
+                                            if let Some(response) = handle.try_recv() {
+                                                match response {
+                                                    OverlayResponse::PasteText(text) => {
+                                                        eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
+                                                        if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
+                                                            eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
+                                                        }
+                                                    }
+                                                    OverlayResponse::Closed => {
+                                                        eprintln!("[TOGGLE-OFF] Overlay closed");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                        }
                                     }
+                                    overlay_handle = None;
+                                    overlay_closed_logged = false;
                                     overlay_word_count = 0;
                                     write_status("paused");
                                 }
@@ -1175,7 +1246,9 @@ async fn main() -> Result<()> {
         &notification_config,
     );
     eprintln!("ears-dictation stopped");
-    Ok(())
+    // Force exit — the GTK overlay thread may still be running app.run_with_args()
+    // which keeps the process alive. Clean shutdown already happened above.
+    std::process::exit(0);
 }
 
 /// Tracks typed words for chunked + final correction

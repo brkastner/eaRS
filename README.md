@@ -311,6 +311,27 @@ The server writes a PID file to `$XDG_STATE_HOME/ears/server.pid` (or `~/.local/
 
 The client streams raw 24 kHz mono PCM to the server and displays each live word as it appears. When the backend signals completion, the final transcript (and optional timestamps) is printed.
 
+## LLM correction (Ollama)
+
+When built with the `llm-correct` feature, dictation can post-correct output using Ollama.
+
+Environment variables:
+
+- `EARS_OLLAMA_URL` (default `http://localhost:11434`)
+- `EARS_OLLAMA_MODEL` (default `qwen2.5:14b`)
+- `EARS_OLLAMA_MODEL_FAST` (optional, fast live corrections)
+- `EARS_OLLAMA_MODEL_FINAL` (optional, stronger final correction)
+- `EARS_OLLAMA_NUM_PREDICT_FAST` (default `128`)
+- `EARS_OLLAMA_NUM_PREDICT_FINAL` (default `512`)
+
+Helper script:
+
+```bash
+./scripts/run-dictation-llm.sh --server ws://127.0.0.1:8770/ws
+```
+
+The script reads `./.env` if present and exports the `EARS_OLLAMA_*` variables.
+
 ## Configuration
 
 Runtime configuration lives at:
