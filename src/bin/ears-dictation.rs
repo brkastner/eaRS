@@ -845,7 +845,7 @@ async fn main() -> Result<()> {
                                 #[cfg(feature = "llm-correct")]
                                 {
                                     correction_buffer.reset_chunk();
-                                    correction_buffer.take_paragraph(); // drain paragraph too
+                                    let _ = correction_buffer.take_paragraph(); // drain paragraph too
                                     overlay_word_count = 0;
                                 }
                                 *capturing.lock().unwrap() = false;
@@ -891,7 +891,7 @@ async fn main() -> Result<()> {
                                             let _ = handle.set_status(OverlayStatus::Correcting);
                                         }
                                         write_status("processing");
-                                        let (paragraph, _word_count) = correction_buffer.take_paragraph();
+                                        let (paragraph, _word_count, _char_count) = correction_buffer.take_paragraph();
                                         match corrector.correct_paragraph(&paragraph).await {
                                             Ok(corrected) if corrected != paragraph => {
                                                 eprintln!("[TOGGLE-OFF FINAL] '{}' -> '{}'", paragraph, corrected);
@@ -1386,14 +1386,15 @@ impl CorrectionBuffer {
         (text, word_count, words)
     }
 
-    fn take_paragraph(&mut self) -> (String, usize) {
+    fn take_paragraph(&mut self) -> (String, usize, usize) {
         let text = self.paragraph_words.join(" ");
         let word_count = self.paragraph_words.len();
+        let char_count = self.paragraph_char_count;
         self.paragraph_words.clear();
         self.paragraph_char_count = 0;
         self.chunk_words.clear();
         self.chunk_char_count = 0;
-        (text, word_count)
+        (text, word_count, char_count)
     }
 
     fn should_correct_chunk(&self, word: &str) -> bool {
@@ -1545,7 +1546,7 @@ async fn correct_final_paragraph(
         return Ok(());
     }
 
-    let (original, word_count) = buffer.take_paragraph();
+    let (original, word_count, char_count) = buffer.take_paragraph();
 
     eprintln!("[FINAL DEBUG] word_count={}, original_len={}", word_count, original.len());
 
@@ -1553,9 +1554,11 @@ async fn correct_final_paragraph(
         Ok(corrected) if corrected != original => {
             eprintln!("[FINAL] '{}' -> '{}'", original, corrected);
 
-            // Delete trailing space first, then delete words with Ctrl+Backspace
-            keyboard.press_key(SpecialKey::Backspace)?;
-            keyboard.delete_words(word_count)?;
+            // Delete trailing space plus typed characters to avoid word-boundary issues
+            let total_backspaces = char_count.saturating_add(1);
+            for _ in 0..total_backspaces {
+                keyboard.press_key(SpecialKey::Backspace)?;
+            }
 
             // Type corrected text
             keyboard.type_text(&corrected)?;
