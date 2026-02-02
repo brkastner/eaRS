@@ -22,6 +22,7 @@ Options:
   --ollama-journal-model <n>  Single model for journal profile.
   --ollama-technical-model<n> Single model for technical profile.
   --only                      Use one model per profile (journal/technical).
+  --no-gateway-autostart       Disable gateway auto-start.
   -h, --help                  Show this help.
 
 If no profile is provided, the script toggles between journal and technical.
@@ -38,6 +39,7 @@ ollama_model=""
 ollama_journal_model=""
 ollama_technical_model=""
 only=false
+gateway_autostart=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,6 +87,10 @@ while [[ $# -gt 0 ]]; do
       only=true
       shift
       ;;
+    --no-gateway-autostart)
+      gateway_autostart=false
+      shift
+      ;;
     --)
       shift
       pass_args=("$@")
@@ -130,6 +136,64 @@ if [[ "$profile" != "journal" && "$profile" != "technical" ]]; then
 fi
 
 echo "$profile" > "$PROFILE_FILE"
+
+if [[ -z "${EARS_SERVER_URL:-}" ]]; then
+  if [[ "$profile" == "technical" ]]; then
+    export EARS_SERVER_URL="ws://127.0.0.1:8771/ws"
+  else
+    export EARS_SERVER_URL="ws://127.0.0.1:8770/ws"
+  fi
+fi
+
+server_url="$EARS_SERVER_URL"
+server_hostport="${server_url#*://}"
+server_hostport="${server_hostport%%/*}"
+server_host="${server_hostport%%:*}"
+server_port="${server_hostport##*:}"
+
+check_tcp() {
+  local host="$1"
+  local port="$2"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 1 "$host" "$port" >/dev/null 2>&1
+    return $?
+  fi
+  (echo > "/dev/tcp/$host/$port") >/dev/null 2>&1
+}
+
+if $gateway_autostart; then
+  if [[ "$server_host" == "127.0.0.1" || "$server_host" == "localhost" || "$server_host" == "::1" ]]; then
+    if [[ "$server_port" == "8770" || "$server_port" == "8771" || "$server_port" == "8772" ]]; then
+      if ! check_tcp "$server_host" "$server_port"; then
+        gateway_dir="${ASR_GATEWAY_DIR:-$HOME/dev/asr-gateway}"
+        if [[ -d "$gateway_dir" ]]; then
+          if command -v just >/dev/null 2>&1; then
+            if [[ ! -f "$gateway_dir/.env" ]]; then
+              echo "asr-gateway .env not found at $gateway_dir/.env" >&2
+            fi
+            case "$server_port" in
+              8770) gateway_target="journal-start" ;;
+              8771) gateway_target="technical-start" ;;
+              8772) gateway_target="accuracy-start" ;;
+              *)
+                if [[ "$profile" == "technical" ]]; then
+                  gateway_target="technical-start"
+                else
+                  gateway_target="journal-start"
+                fi
+                ;;
+            esac
+            (cd "$gateway_dir" && just "$gateway_target")
+          else
+            echo "just not found; cannot start gateway" >&2
+          fi
+        else
+          echo "asr-gateway not found at $gateway_dir" >&2
+        fi
+      fi
+    fi
+  fi
+fi
 
 ollama_url="${EARS_OLLAMA_URL:-http://127.0.0.1:11434}"
 ollama_host="${ollama_url#*://}"

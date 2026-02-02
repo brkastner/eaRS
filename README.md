@@ -351,6 +351,12 @@ Profile toggle script:
 ./scripts/toggle-dictation-profile.sh   # toggles between profiles
 ```
 
+Gateway auto-start (default):
+
+- If `EARS_SERVER_URL` points to `127.0.0.1:8770/8771/8772`, the script will try to
+  start `asr-gateway` using `just` from `$HOME/dev/asr-gateway`.
+- Disable with `--no-gateway-autostart`.
+
 Ollama helpers:
 
 ```bash
