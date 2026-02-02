@@ -6,8 +6,13 @@ use ears::audio;
 use ears::config::DictationHooksConfig;
 use ears::config::{AppConfig, DictationNotificationConfig};
 #[cfg(feature = "llm-correct")]
-use ears::llm_correct::{LlmCorrectConfig, SentenceCorrector};
-use ears::virtual_keyboard::{create_virtual_keyboard, VirtualKeyboard, SpecialKey};
+use ears::llm_correct::{CorrectionProfile, LlmCorrectConfig, SentenceCorrector};
+use ears::virtual_keyboard::{
+    create_virtual_keyboard_with_timing,
+    KeyboardTiming,
+    VirtualKeyboard,
+    SpecialKey,
+};
 #[cfg(feature = "preview-overlay")]
 use ears::clipboard::copy_and_paste;
 #[cfg(feature = "preview-overlay")]
@@ -20,7 +25,7 @@ use std::fs;
 #[cfg(feature = "hooks")]
 use std::process::Command as ProcessCommand;
 #[cfg(feature = "llm-correct")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::signal::unix::{signal, SignalKind};
@@ -38,6 +43,23 @@ enum EngineArg {
     Kyutai,
     #[cfg(feature = "parakeet")]
     Parakeet,
+}
+
+#[cfg(feature = "llm-correct")]
+#[derive(Clone, Debug, clap::ValueEnum)]
+enum CorrectionProfileArg {
+    Journal,
+    Technical,
+}
+
+#[cfg(feature = "llm-correct")]
+impl From<CorrectionProfileArg> for CorrectionProfile {
+    fn from(value: CorrectionProfileArg) -> Self {
+        match value {
+            CorrectionProfileArg::Journal => CorrectionProfile::Journal,
+            CorrectionProfileArg::Technical => CorrectionProfile::Technical,
+        }
+    }
 }
 
 impl EngineArg {
@@ -133,6 +155,56 @@ struct Args {
         help = "Max tokens for final correction"
     )]
     ollama_num_predict_final: i32,
+
+    #[cfg(feature = "llm-correct")]
+    #[arg(
+        long,
+        env = "EARS_CORRECTION_PROFILE",
+        value_enum,
+        default_value = "journal",
+        help = "Correction profile (journal|technical)"
+    )]
+    correction_profile: CorrectionProfileArg,
+
+    #[arg(
+        long,
+        env = "EARS_TYPE_DELAY_US",
+        default_value_t = 500,
+        help = "Delay between typed characters (microseconds)"
+    )]
+    type_delay_us: u64,
+
+    #[arg(
+        long,
+        env = "EARS_KEY_DELAY_US",
+        default_value_t = 500,
+        help = "Delay after non-backspace key presses (microseconds)"
+    )]
+    key_delay_us: u64,
+
+    #[arg(
+        long,
+        env = "EARS_BACKSPACE_DELAY_MS",
+        default_value_t = 15,
+        help = "Delay after backspace presses (milliseconds)"
+    )]
+    backspace_delay_ms: u64,
+
+    #[arg(
+        long,
+        env = "EARS_DELETE_WORD_DELAY_MS",
+        default_value_t = 10,
+        help = "Delay between Ctrl+Backspace word deletions (milliseconds)"
+    )]
+    delete_word_delay_ms: u64,
+
+    #[arg(
+        long,
+        env = "EARS_CHORD_DELAY_MS",
+        default_value_t = 5,
+        help = "Delay after modifier chords (milliseconds)"
+    )]
+    chord_delay_ms: u64,
 
     #[cfg(feature = "preview-overlay")]
     #[arg(
@@ -525,7 +597,14 @@ async fn main() -> Result<()> {
             Ok((ws_stream, _)) => {
                 eprintln!("Connected to transcription server");
                 let (mut write, mut read) = ws_stream.split();
-                let mut keyboard = create_virtual_keyboard()
+                let timing = KeyboardTiming {
+                    char_delay: Duration::from_micros(args.type_delay_us),
+                    key_delay: Duration::from_micros(args.key_delay_us),
+                    backspace_delay: Duration::from_millis(args.backspace_delay_ms),
+                    delete_word_delay: Duration::from_millis(args.delete_word_delay_ms),
+                    chord_delay: Duration::from_millis(args.chord_delay_ms),
+                };
+                let mut keyboard = create_virtual_keyboard_with_timing(timing)
                     .context("Failed to initialize virtual keyboard. \
                               On Linux/Wayland, ensure you are in the 'input' group.")?;
 
@@ -555,6 +634,7 @@ async fn main() -> Result<()> {
                         num_predict_fast: args.ollama_num_predict_fast,
                         num_predict_final: args.ollama_num_predict_final,
                         temperature: 0.1,
+                        profile: args.correction_profile.into(),
                     };
                     eprintln!(
                         "LLM correction enabled: live={} final={} ({})",
@@ -565,7 +645,7 @@ async fn main() -> Result<()> {
                     SentenceCorrector::new(config)?
                 };
                 #[cfg(feature = "llm-correct")]
-                let mut correction_buffer = CorrectionBuffer::new();
+                let mut correction_buffer = CorrectionBuffer::new(args.correction_profile.into());
                 #[cfg(feature = "llm-correct")]
                 let mut last_word_time = Instant::now();
                 // Track how many words have been sent to the overlay since last checkpoint/commit
@@ -1262,17 +1342,23 @@ struct CorrectionBuffer {
     paragraph_char_count: usize,
     /// Words per chunk before triggering correction
     chunk_size: usize,
+    correct_on_commas: bool,
 }
 
 #[cfg(feature = "llm-correct")]
 impl CorrectionBuffer {
-    fn new() -> Self {
+    fn new(profile: CorrectionProfile) -> Self {
+        let (chunk_size, correct_on_commas) = match profile {
+            CorrectionProfile::Journal => (6, true),
+            CorrectionProfile::Technical => (10, false),
+        };
         Self {
             chunk_words: Vec::new(),
             chunk_char_count: 0,
             paragraph_words: Vec::new(),
             paragraph_char_count: 0,
-            chunk_size: 6,
+            chunk_size,
+            correct_on_commas,
         }
     }
 
@@ -1313,12 +1399,12 @@ impl CorrectionBuffer {
     fn should_correct_chunk(&self, word: &str) -> bool {
         let trimmed = word.trim();
         // Correct on: sentence end, comma, semicolon, or chunk size reached
-        trimmed.ends_with('.')
+        let ends_sentence = trimmed.ends_with('.')
             || trimmed.ends_with('?')
-            || trimmed.ends_with('!')
-            || trimmed.ends_with(',')
-            || trimmed.ends_with(';')
-            || self.chunk_words.len() >= self.chunk_size
+            || trimmed.ends_with('!');
+        let ends_minor = trimmed.ends_with(',') || trimmed.ends_with(';');
+
+        ends_sentence || (self.correct_on_commas && ends_minor) || self.chunk_words.len() >= self.chunk_size
     }
 
     fn chunk_len(&self) -> usize {

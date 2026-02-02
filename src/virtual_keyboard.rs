@@ -7,10 +7,10 @@
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
 #[cfg(target_os = "linux")]
-use uinput::{Device, event::keyboard};
+use uinput::{event::keyboard, Device};
 
 use enigo::{Direction, Enigo, Keyboard, Settings};
 
@@ -33,6 +33,27 @@ pub trait VirtualKeyboard {
 
     /// Send a key chord (modifiers + character)
     fn send_chord(&mut self, modifiers: &[Modifier], ch: char) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct KeyboardTiming {
+    pub char_delay: Duration,
+    pub key_delay: Duration,
+    pub backspace_delay: Duration,
+    pub delete_word_delay: Duration,
+    pub chord_delay: Duration,
+}
+
+impl Default for KeyboardTiming {
+    fn default() -> Self {
+        Self {
+            char_delay: Duration::from_micros(500),
+            key_delay: Duration::from_micros(500),
+            backspace_delay: Duration::from_millis(15),
+            delete_word_delay: Duration::from_millis(10),
+            chord_delay: Duration::from_millis(5),
+        }
+    }
 }
 
 /// Special keys that can be pressed
@@ -61,20 +82,26 @@ pub enum Modifier {
 
 /// Create the appropriate keyboard implementation for the current platform
 pub fn create_virtual_keyboard() -> Result<Box<dyn VirtualKeyboard>> {
+    create_virtual_keyboard_with_timing(KeyboardTiming::default())
+}
+
+pub fn create_virtual_keyboard_with_timing(
+    timing: KeyboardTiming,
+) -> Result<Box<dyn VirtualKeyboard>> {
     #[cfg(target_os = "linux")]
     {
-        UInputKeyboard::new()
+        UInputKeyboard::new(timing)
             .map(|kb| Box::new(kb) as Box<dyn VirtualKeyboard>)
             .or_else(|e| {
                 eprintln!("Warning: Failed to create uinput keyboard: {}", e);
                 eprintln!("Falling back to enigo (may not work properly on Wayland)");
-                Ok(Box::new(EnigoKeyboard::new()?) as Box<dyn VirtualKeyboard>)
+                Ok(Box::new(EnigoKeyboard::new(timing)?) as Box<dyn VirtualKeyboard>)
             })
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
-        Ok(Box::new(EnigoKeyboard::new()?))
+        Ok(Box::new(EnigoKeyboard::new(timing)?))
     }
 }
 
@@ -85,43 +112,65 @@ pub fn create_virtual_keyboard() -> Result<Box<dyn VirtualKeyboard>> {
 #[cfg(target_os = "linux")]
 pub struct UInputKeyboard {
     device: Device,
+    timing: KeyboardTiming,
 }
 
 #[cfg(target_os = "linux")]
 impl UInputKeyboard {
-    pub fn new() -> Result<Self> {
+    pub fn new(timing: KeyboardTiming) -> Result<Self> {
         // Try to open /dev/uinput
         let device = uinput::open("/dev/uinput")
-            .context("Failed to open /dev/uinput. Please ensure:\n\
+            .context(
+                "Failed to open /dev/uinput. Please ensure:\n\
                       1. You are in the 'input' group: sudo usermod -a -G input $USER\n\
                       2. The uinput module is loaded: sudo modprobe uinput\n\
-                      3. You have logged out and back in after adding to group")?
+                      3. You have logged out and back in after adding to group",
+            )?
             .name("eaRS Virtual Keyboard")?
             .event(keyboard::Keyboard::All)?
             .create()
             .context("Failed to create uinput device")?;
-        
-        Ok(Self { device })
+
+        Ok(Self { device, timing })
     }
-    
+
     fn type_char(&mut self, ch: char) -> Result<()> {
-        let needs_shift = ch.is_ascii_uppercase() || matches!(ch, 
-            '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')' |
-            '_' | '+' | '{' | '}' | '|' | ':' | '"' | '<' | '>' | '?'
-        );
-        
+        let needs_shift = ch.is_ascii_uppercase()
+            || matches!(
+                ch,
+                '!' | '@'
+                    | '#'
+                    | '$'
+                    | '%'
+                    | '^'
+                    | '&'
+                    | '*'
+                    | '('
+                    | ')'
+                    | '_'
+                    | '+'
+                    | '{'
+                    | '}'
+                    | '|'
+                    | ':'
+                    | '"'
+                    | '<'
+                    | '>'
+                    | '?'
+            );
+
         let key = char_to_key(ch)?;
-        
+
         if needs_shift {
             self.device.press(&keyboard::Key::LeftShift)?;
         }
-        
+
         self.device.click(&key)?;
-        
+
         if needs_shift {
             self.device.release(&keyboard::Key::LeftShift)?;
         }
-        
+
         self.device.synchronize()?;
         Ok(())
     }
@@ -135,7 +184,7 @@ impl VirtualKeyboard for UInputKeyboard {
             if let Err(_) = self.type_char(ch) {
                 continue;
             }
-            thread::sleep(Duration::from_micros(500));
+            thread::sleep(self.timing.char_delay);
         }
         Ok(())
     }
@@ -159,9 +208,9 @@ impl VirtualKeyboard for UInputKeyboard {
         // Delay between key events - longer for backspace to ensure apps process them
         // Many apps rate-limit or buffer keyboard input; 15ms seems safe for most
         let delay = if matches!(key, SpecialKey::Backspace) {
-            Duration::from_millis(15)
+            self.timing.backspace_delay
         } else {
-            Duration::from_micros(500)
+            self.timing.key_delay
         };
         thread::sleep(delay);
         Ok(())
@@ -174,7 +223,7 @@ impl VirtualKeyboard for UInputKeyboard {
             self.device.click(&keyboard::Key::BackSpace)?;
             self.device.release(&keyboard::Key::LeftControl)?;
             self.device.synchronize()?;
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(self.timing.delete_word_delay);
         }
         Ok(())
     }
@@ -209,7 +258,7 @@ impl VirtualKeyboard for UInputKeyboard {
         }
 
         self.device.synchronize()?;
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(self.timing.chord_delay);
         Ok(())
     }
 }
@@ -227,20 +276,46 @@ fn modifier_to_uinput_key(modifier: Modifier) -> keyboard::Key {
 #[cfg(target_os = "linux")]
 fn char_to_key(ch: char) -> Result<keyboard::Key> {
     use keyboard::Key::*;
-    
+
     let key = match ch.to_ascii_lowercase() {
-        'a' => A, 'b' => B, 'c' => C, 'd' => D, 'e' => E,
-        'f' => F, 'g' => G, 'h' => H, 'i' => I, 'j' => J,
-        'k' => K, 'l' => L, 'm' => M, 'n' => N, 'o' => O,
-        'p' => P, 'q' => Q, 'r' => R, 's' => S, 't' => T,
-        'u' => U, 'v' => V, 'w' => W, 'x' => X, 'y' => Y,
+        'a' => A,
+        'b' => B,
+        'c' => C,
+        'd' => D,
+        'e' => E,
+        'f' => F,
+        'g' => G,
+        'h' => H,
+        'i' => I,
+        'j' => J,
+        'k' => K,
+        'l' => L,
+        'm' => M,
+        'n' => N,
+        'o' => O,
+        'p' => P,
+        'q' => Q,
+        'r' => R,
+        's' => S,
+        't' => T,
+        'u' => U,
+        'v' => V,
+        'w' => W,
+        'x' => X,
+        'y' => Y,
         'z' => Z,
-        
-        '0' | ')' => _0, '1' | '!' => _1, '2' | '@' => _2,
-        '3' | '#' => _3, '4' | '$' => _4, '5' | '%' => _5,
-        '6' | '^' => _6, '7' | '&' => _7, '8' | '*' => _8,
+
+        '0' | ')' => _0,
+        '1' | '!' => _1,
+        '2' | '@' => _2,
+        '3' | '#' => _3,
+        '4' | '$' => _4,
+        '5' | '%' => _5,
+        '6' | '^' => _6,
+        '7' | '&' => _7,
+        '8' | '*' => _8,
         '9' | '(' => _9,
-        
+
         ' ' => Space,
         '-' | '_' => Minus,
         '=' | '+' => Equal,
@@ -253,13 +328,13 @@ fn char_to_key(ch: char) -> Result<keyboard::Key> {
         '.' | '>' => Dot,
         '/' | '?' => Slash,
         '`' | '~' => Grave,
-        
+
         '\n' => Enter,
         '\t' => Tab,
-        
+
         _ => return Err(anyhow!("Unsupported character: '{}'", ch)),
     };
-    
+
     Ok(key)
 }
 
@@ -269,20 +344,26 @@ fn char_to_key(ch: char) -> Result<keyboard::Key> {
 
 pub struct EnigoKeyboard {
     enigo: Enigo,
+    timing: KeyboardTiming,
 }
 
 impl EnigoKeyboard {
-    pub fn new() -> Result<Self> {
+    pub fn new(timing: KeyboardTiming) -> Result<Self> {
         let enigo = Enigo::new(&Settings::default())
             .context("Failed to initialize enigo keyboard controller")?;
-        Ok(Self { enigo })
+        Ok(Self { enigo, timing })
     }
 }
 
 impl VirtualKeyboard for EnigoKeyboard {
     fn type_text(&mut self, text: &str) -> Result<()> {
-        self.enigo.text(text)
-            .context("Failed to type text with enigo")
+        for ch in text.chars() {
+            self.enigo
+                .key(enigo::Key::Unicode(ch), Direction::Click)
+                .context("Failed to type text with enigo")?;
+            thread::sleep(self.timing.char_delay);
+        }
+        Ok(())
     }
 
     fn press_key(&mut self, key: SpecialKey) -> Result<()> {
@@ -301,34 +382,47 @@ impl VirtualKeyboard for EnigoKeyboard {
             SpecialKey::Down => DownArrow,
         };
 
-        self.enigo.key(enigo_key, Direction::Click)
-            .context("Failed to press key with enigo")
+        self.enigo
+            .key(enigo_key, Direction::Click)
+            .context("Failed to press key with enigo")?;
+        let delay = if matches!(key, SpecialKey::Backspace) {
+            self.timing.backspace_delay
+        } else {
+            self.timing.key_delay
+        };
+        thread::sleep(delay);
+        Ok(())
     }
 
     fn delete_words(&mut self, count: usize) -> Result<()> {
         use enigo::Key::*;
         // Use Ctrl+Backspace to delete whole words
         for _ in 0..count {
-            self.enigo.key(Control, Direction::Press)
+            self.enigo
+                .key(Control, Direction::Press)
                 .context("Failed to press Ctrl")?;
-            self.enigo.key(Backspace, Direction::Click)
+            self.enigo
+                .key(Backspace, Direction::Click)
                 .context("Failed to press Backspace")?;
-            self.enigo.key(Control, Direction::Release)
+            self.enigo
+                .key(Control, Direction::Release)
                 .context("Failed to release Ctrl")?;
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(self.timing.delete_word_delay);
         }
         Ok(())
     }
 
     fn press_modifier(&mut self, modifier: Modifier) -> Result<()> {
         let key = modifier_to_enigo_key(modifier);
-        self.enigo.key(key, Direction::Press)
+        self.enigo
+            .key(key, Direction::Press)
             .context("Failed to press modifier")
     }
 
     fn release_modifier(&mut self, modifier: Modifier) -> Result<()> {
         let key = modifier_to_enigo_key(modifier);
-        self.enigo.key(key, Direction::Release)
+        self.enigo
+            .key(key, Direction::Release)
             .context("Failed to release modifier")
     }
 
@@ -337,21 +431,24 @@ impl VirtualKeyboard for EnigoKeyboard {
 
         // Press all modifiers
         for &m in modifiers {
-            self.enigo.key(modifier_to_enigo_key(m), Direction::Press)
+            self.enigo
+                .key(modifier_to_enigo_key(m), Direction::Press)
                 .context("Failed to press modifier")?;
         }
 
         // Press the character key
-        self.enigo.key(Unicode(ch), Direction::Click)
+        self.enigo
+            .key(Unicode(ch), Direction::Click)
             .context("Failed to press character")?;
 
         // Release all modifiers (in reverse order)
         for &m in modifiers.iter().rev() {
-            self.enigo.key(modifier_to_enigo_key(m), Direction::Release)
+            self.enigo
+                .key(modifier_to_enigo_key(m), Direction::Release)
                 .context("Failed to release modifier")?;
         }
 
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(self.timing.chord_delay);
         Ok(())
     }
 }

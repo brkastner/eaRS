@@ -25,6 +25,14 @@ pub struct LlmCorrectConfig {
     pub num_predict_final: i32,
     /// Sampling temperature
     pub temperature: f32,
+    /// Correction profile (journal or technical)
+    pub profile: CorrectionProfile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrectionProfile {
+    Journal,
+    Technical,
 }
 
 impl Default for LlmCorrectConfig {
@@ -37,6 +45,7 @@ impl Default for LlmCorrectConfig {
             num_predict_fast: 128,
             num_predict_final: 512,
             temperature: 0.1,
+            profile: CorrectionProfile::Journal,
         }
     }
 }
@@ -148,12 +157,20 @@ impl SentenceCorrector {
 
     /// Send a chunk to the LLM for correction
     pub async fn correct_sentence(&self, sentence: &str) -> Result<String> {
-        let prompt = format!(
-            r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Preserve code identifiers, file paths, flags, and casing. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
+        let prompt = match self.config.profile {
+            CorrectionProfile::Journal => format!(
+                r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Remove filler words (uh, um) when they are standalone. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
 
 Text: {}"#,
-            sentence
-        );
+                sentence
+            ),
+            CorrectionProfile::Technical => format!(
+                r#"Fix transcription errors and punctuation in this dictated text. Preserve code identifiers, file paths, flags, casing, and acronyms. Do not rewrite or normalize code-like tokens. Avoid stylistic rewrites. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
+
+Text: {}"#,
+                sentence
+            ),
+        };
 
         self.call_ollama(&prompt, &self.config.model, self.config.num_predict_fast)
             .await
@@ -161,18 +178,28 @@ Text: {}"#,
 
     /// Final paragraph correction with more thorough cleanup
     pub async fn correct_paragraph(&self, paragraph: &str) -> Result<String> {
-        let prompt = format!(
-            r#"Clean up this dictated paragraph. Fix:
+        let prompt = match self.config.profile {
+            CorrectionProfile::Journal => format!(
+                r#"Clean up this dictated paragraph. Fix:
 - Transcription errors (bath→batch, B4→before)
 - Grammar and punctuation
 - Remove filler words (uh, um)
 - Fix sentence boundaries
-IMPORTANT: Preserve code identifiers, file paths, flags, and casing. Preserve all line breaks and paragraph structure exactly.
+IMPORTANT: Preserve all line breaks and paragraph structure exactly.
 Output ONLY the corrected text, preserving meaning.
 
 Text: {}"#,
-            paragraph
-        );
+                paragraph
+            ),
+            CorrectionProfile::Technical => format!(
+                r#"Clean up this dictated paragraph. Fix transcription errors and punctuation while preserving meaning.
+IMPORTANT: Preserve code identifiers, file paths, flags, casing, and acronyms. Do not rewrite or normalize code-like tokens. Preserve all line breaks and paragraph structure exactly.
+Output ONLY the corrected text.
+
+Text: {}"#,
+                paragraph
+            ),
+        };
 
         self.call_ollama(
             &prompt,

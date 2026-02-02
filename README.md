@@ -323,6 +323,15 @@ Environment variables:
 - `EARS_OLLAMA_MODEL_FINAL` (optional, stronger final correction)
 - `EARS_OLLAMA_NUM_PREDICT_FAST` (default `128`)
 - `EARS_OLLAMA_NUM_PREDICT_FINAL` (default `512`)
+- `EARS_CORRECTION_PROFILE` (default `journal`, options: `journal|technical`)
+
+Typing delay controls (for apps that drop fast input):
+
+- `EARS_TYPE_DELAY_US` (default `500`)
+- `EARS_KEY_DELAY_US` (default `500`)
+- `EARS_BACKSPACE_DELAY_MS` (default `15`)
+- `EARS_DELETE_WORD_DELAY_MS` (default `10`)
+- `EARS_CHORD_DELAY_MS` (default `5`)
 
 Helper script:
 
