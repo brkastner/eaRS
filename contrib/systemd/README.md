@@ -34,9 +34,8 @@ systemctl --user enable --now ears-server ears-dictation
 
 ### Remote Setup (desktop server + laptop client via Tailscale)
 
-Remote setups still work, but we no longer ship a dedicated systemd unit.
-Use your window manager autostart, or copy the local unit and override its
-environment variables.
+Remote setups still work using `ears-dictation-remote.service`, which defaults
+to Tailscale hostname `athena`.
 
 ## LLM Correction
 

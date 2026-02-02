@@ -134,4 +134,4 @@ cargo build --release --features parakeet,llm-correct,hooks
 ### Correction Timing
 - Chunk correction: 6 words OR punctuation OR 2s pause
 - Final correction: 5s pause OR toggle off
-- Both use Ollama with `qwen2.5:7b` model by default
+- Both use Ollama with `qwen2.5:14b` model by default

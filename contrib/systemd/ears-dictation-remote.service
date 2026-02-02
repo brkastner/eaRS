@@ -1,0 +1,18 @@
+[Unit]
+Description=eaRS dictation client (remote server over Tailscale)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p %h/.local/state/ears
+# Defaults with hostname override for Tailscale
+Environment=EARS_SERVER_URL=ws://athena:8765
+Environment=EARS_OLLAMA_URL=http://athena:11434
+ExecStart=%h/.cargo/bin/ears-dictation
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:%h/.local/state/ears/dictation.log
+StandardError=append:%h/.local/state/ears/dictation.log
+
+[Install]
+WantedBy=default.target
