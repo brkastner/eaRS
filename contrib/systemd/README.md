@@ -34,36 +34,9 @@ systemctl --user enable --now ears-server ears-dictation
 
 ### Remote Setup (desktop server + laptop client via Tailscale)
 
-This setup runs the STT server and Ollama on a powerful desktop, with the
-dictation client on a laptop connecting over Tailscale.
-
-**On desktop (server):**
-```bash
-# Install and start Ollama
-curl -fsSL https://ollama.com/install.sh | sh
-sudo systemctl enable --now ollama
-ollama pull qwen2.5:7b
-
-# Start ears-server (binds to all interfaces)
-systemctl --user enable --now ears-server-remote
-```
-
-**On laptop (client):**
-```bash
-# Build with LLM correction support
-cargo install --features "parakeet,amd,llm-correct" --path .
-
-# Create override with your desktop's Tailscale hostname
-mkdir -p ~/.config/systemd/user/ears-dictation-remote.service.d
-cat > ~/.config/systemd/user/ears-dictation-remote.service.d/override.conf << 'EOF'
-[Service]
-Environment=EARS_SERVER_URL=ws://YOUR-DESKTOP.tailnet:8765
-Environment=EARS_OLLAMA_URL=http://YOUR-DESKTOP.tailnet:11434
-EOF
-
-systemctl --user daemon-reload
-systemctl --user enable --now ears-dictation-remote
-```
+Remote setups still work, but we no longer ship a dedicated systemd unit.
+Use your window manager autostart, or copy the local unit and override its
+environment variables.
 
 ## LLM Correction
 
@@ -75,11 +48,13 @@ boundaries by backspacing and retyping.
 **Environment variables:**
 - `EARS_SERVER_URL` - WebSocket URL of ears-server (default: ws://127.0.0.1:8765)
 - `EARS_OLLAMA_URL` - Ollama API endpoint (default: http://localhost:11434)
-- `EARS_OLLAMA_MODEL` - Model for correction (default: qwen2.5:7b)
+- `EARS_OLLAMA_MODEL` - Model for correction (default: qwen2.5:14b)
+- `EARS_OLLAMA_MODEL_FAST` / `EARS_OLLAMA_MODEL_FINAL` - Split fast/final models
+- `EARS_CORRECTION_PROFILE` - `journal` or `technical`
 
 **CLI options:**
 ```bash
-ears-dictation --server ws://desktop:8765 --ollama-url http://desktop:11434 --ollama-model qwen2.5:7b
+ears-dictation --server ws://desktop:8765 --ollama-url http://desktop:11434 --ollama-model qwen2.5:14b
 ```
 
 ## Logs
