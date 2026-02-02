@@ -6,7 +6,7 @@ Reference document for future Claude sessions working on this fork.
 
 | Machine | Hostname | Compositor | GPU | Role |
 |---------|----------|-----------|-----|------|
-| Desktop | athena | Hyprland | 7900xtx | Runs `ears-server` (Parakeet STT), Ollama (qwen2.5:7b) |
+| Desktop | athena | Hyprland | 7900xtx | Runs `ears-server` (Parakeet STT), Ollama (qwen2.5:14b) |
 | Laptop | fw | niri | integrated | Runs `ears-dictation` client, connects to athena over Tailscale |
 
 - Tailscale connects fw <-> athena. Use Tailscale hostnames (`athena`, `fw`) not IPs.
@@ -31,6 +31,25 @@ Automatic grammar/punctuation cleanup of transcribed text via Ollama.
 Key files:
 - `src/llm_correct.rs` - Ollama API client and correction logic
 - `src/bin/ears-dictation.rs` - CorrectionBuffer, pause detection, chunk/paragraph triggers
+
+### Follow-up: two-model correction (feature request)
+
+**Current approach**: use a single model per profile to avoid VRAM thrash.
+
+- Journal profile defaults to `qwen2.5:7b`
+- Technical profile defaults to `qwen2.5:32b-16k`
+- Toggle script uses `--only` to force one model and unload others
+
+**Reason**: running both a fast model and a large final model simultaneously on a 7900XTX (with Parakeet on ROCm) tends to thrash VRAM or cause slow reloads. UX goal is "always-ready" toggles.
+
+**Feature request (future)**: add an optional two-model mode that:
+
+- Keeps the fast model loaded for live corrections
+- Loads the final model only on toggle-off/commit
+- Immediately unloads the final model after use (`keep_alive: 0`) to free VRAM
+- Uses Ollama API `/api/generate` `keep_alive` to control model residency
+
+This would require wiring per-call `keep_alive` and model selection into `llm_correct.rs`, and possibly adding a `final_keep_alive` setting.
 
 ### Preview Overlay (`preview-overlay` feature)
 
@@ -90,7 +109,7 @@ fw (laptop, niri)                          athena (desktop, Hyprland)
 │  │ gtk4 overlay   │  │
 │  │ (layer-shell)  │  │───HTTP───────────>┌──────────────────────┐
 │  └────────────────┘  │  http://athena:   │  Ollama              │
-│                      │  11434            │  qwen2.5:7b           │
+│                      │  11434            │  qwen2.5:14b           │
 │  ┌────────────────┐  │                   └──────────────────────┘
 │  │ uinput vkbd    │  │
 │  │ (types text)   │  │
@@ -112,7 +131,7 @@ Remote service env vars:
 ```
 EARS_SERVER_URL=ws://athena:8765
 EARS_OLLAMA_URL=http://athena:11434
-EARS_OLLAMA_MODEL=qwen2.5:7b
+EARS_OLLAMA_MODEL=qwen2.5:14b
 ```
 
 ## Build Commands
