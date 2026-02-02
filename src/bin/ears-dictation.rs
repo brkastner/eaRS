@@ -26,6 +26,7 @@ use std::fs;
 use std::process::Command as ProcessCommand;
 #[cfg(feature = "llm-correct")]
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,6 +50,12 @@ enum EngineArg {
 #[cfg(feature = "llm-correct")]
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum CorrectionProfileArg {
+    Journal,
+    Technical,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
+enum AccuracyProfileArg {
     Journal,
     Technical,
 }
@@ -215,6 +222,39 @@ struct Args {
     )]
     capture_grace_ms: u64,
 
+    #[arg(
+        long,
+        env = "EARS_ACCURACY_URL",
+        default_value = "",
+        help = "Optional accuracy pass WebSocket URL (e.g. ws://127.0.0.1:8772/ws)"
+    )]
+    accuracy_url: String,
+
+    #[arg(
+        long,
+        env = "EARS_ACCURACY_PROFILE",
+        value_enum,
+        default_value = "technical",
+        help = "Profile that triggers accuracy pass (journal|technical)"
+    )]
+    accuracy_profile: AccuracyProfileArg,
+
+    #[arg(
+        long,
+        env = "EARS_ACCURACY_TIMEOUT_MS",
+        default_value_t = 6000,
+        help = "Timeout for accuracy pass in milliseconds"
+    )]
+    accuracy_timeout_ms: u64,
+
+    #[arg(
+        long,
+        env = "EARS_ACCURACY_MAX_SECONDS",
+        default_value_t = 60,
+        help = "Maximum audio seconds to keep for accuracy pass"
+    )]
+    accuracy_max_seconds: u64,
+
     #[cfg(feature = "preview-overlay")]
     #[arg(
         long,
@@ -283,6 +323,8 @@ async fn main() -> Result<()> {
     let running = Arc::new(Mutex::new(true));
     let capturing = Arc::new(Mutex::new(false));
     let capture_grace_until = Arc::new(Mutex::new(None::<Instant>));
+    let accuracy_buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+    let accuracy_max_samples = (args.accuracy_max_seconds as usize) * 24_000;
     let dictation_state = Arc::new(Mutex::new(DictationState::Inactive));
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
@@ -334,6 +376,7 @@ async fn main() -> Result<()> {
         let sig_capturing = capturing.clone();
         let sig_grace = capture_grace_until.clone();
         let sig_grace_ms = args.capture_grace_ms;
+        let sig_buffer = accuracy_buffer.clone();
         let sig_state = dictation_state.clone();
         let sig_notif = config.dictation.notifications.clone();
         #[cfg(feature = "hooks")]
@@ -349,6 +392,8 @@ async fn main() -> Result<()> {
                 if is_active {
                     let mut grace = sig_grace.lock().unwrap();
                     *grace = None;
+                    let mut buf = sig_buffer.lock().unwrap();
+                    buf.clear();
                 } else {
                     let mut grace = sig_grace.lock().unwrap();
                     *grace = Some(Instant::now() + Duration::from_millis(sig_grace_ms));
@@ -414,6 +459,7 @@ async fn main() -> Result<()> {
             let hotkey_capturing = capturing.clone();
             let hotkey_grace = capture_grace_until.clone();
             let hotkey_grace_ms = args.capture_grace_ms;
+            let hotkey_buffer = accuracy_buffer.clone();
     let hotkey_config = config.hotkeys.clone();
     let notification_config = config.dictation.notifications.clone();
     #[cfg(feature = "hooks")]
@@ -513,6 +559,8 @@ async fn main() -> Result<()> {
                             if is_active {
                                 let mut grace = hotkey_grace.lock().unwrap();
                                 *grace = None;
+                                let mut buf = hotkey_buffer.lock().unwrap();
+                                buf.clear();
                             } else {
                                 let mut grace = hotkey_grace.lock().unwrap();
                                 *grace = Some(Instant::now() + Duration::from_millis(hotkey_grace_ms));
@@ -708,6 +756,8 @@ async fn main() -> Result<()> {
                 let audio_rx_clone = audio_rx.clone();
                 let audio_capturing = capturing.clone();
                 let audio_grace = capture_grace_until.clone();
+                let audio_buffer = accuracy_buffer.clone();
+                let max_samples = accuracy_max_samples;
                 thread::spawn(move || {
                     while let Ok(chunk) = audio_rx_clone.recv() {
                         let should_send = {
@@ -730,6 +780,15 @@ async fn main() -> Result<()> {
                         };
 
                         if should_send {
+                            if max_samples > 0 {
+                                let mut buf = audio_buffer.lock().unwrap();
+                                for sample in &chunk {
+                                    buf.push_back(*sample);
+                                }
+                                while buf.len() > max_samples {
+                                    buf.pop_front();
+                                }
+                            }
                             if audio_writer
                                 .send(WriterCommand::Audio(encode_chunk(&chunk)))
                                 .is_err()
@@ -1032,6 +1091,8 @@ async fn main() -> Result<()> {
                                             &mut keyboard,
                                             &mut correction_buffer,
                                             &mut corrector,
+                                            &accuracy_buffer,
+                                            &args,
                                         ).await {
                                             eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
                                         }
@@ -1074,6 +1135,8 @@ async fn main() -> Result<()> {
                                             &mut keyboard,
                                             &mut correction_buffer,
                                             &mut corrector,
+                                            &accuracy_buffer,
+                                            &args,
                                         ).await {
                                             eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
                                         }
@@ -1335,6 +1398,8 @@ async fn main() -> Result<()> {
                                             &mut keyboard,
                                             &mut correction_buffer,
                                             &mut corrector,
+                                            &accuracy_buffer,
+                                            &args,
                                         ).await {
                                             eprintln!("[FINAL ERROR] {}", e);
                                         }
@@ -1419,6 +1484,8 @@ async fn main() -> Result<()> {
                                             &mut keyboard,
                                             &mut correction_buffer,
                                             &mut corrector,
+                                            &accuracy_buffer,
+                                            &args,
                                         ).await {
                                             eprintln!("[FINAL ERROR] {}", e);
                                         }
@@ -1773,6 +1840,8 @@ async fn correct_final_paragraph(
     keyboard: &mut Box<dyn VirtualKeyboard>,
     buffer: &mut CorrectionBuffer,
     corrector: &mut SentenceCorrector,
+    accuracy_buffer: &Arc<Mutex<VecDeque<f32>>>,
+    args: &Args,
 ) -> Result<()> {
     if buffer.paragraph_len() < 2 {
         return Ok(());
@@ -1782,6 +1851,7 @@ async fn correct_final_paragraph(
 
     eprintln!("[FINAL DEBUG] word_count={}, original_len={}", word_count, original.len());
 
+    let mut final_text = original.clone();
     match corrector.correct_paragraph(&original).await {
         Ok(corrected) if corrected != original => {
             if !is_safe_correction(&original, &corrected, corrector.profile()) {
@@ -1799,12 +1869,31 @@ async fn correct_final_paragraph(
             // Type corrected text
             keyboard.type_text(&corrected)?;
             keyboard.press_key(SpecialKey::Space)?;
+            final_text = corrected;
         }
         Ok(_) => {
             eprintln!("[FINAL] No changes needed");
         }
         Err(e) => {
             eprintln!("[FINAL ERROR] {}", e);
+        }
+    }
+
+    if should_run_accuracy(args) {
+        if let Ok(Some(accuracy_text)) = run_accuracy_pass(accuracy_buffer, args).await {
+            if accuracy_text != final_text
+                && is_safe_correction(&final_text, &accuracy_text, corrector.profile())
+            {
+                eprintln!("[ACCURACY] '{}' -> '{}'", final_text, accuracy_text);
+                let backspaces = final_text.len().saturating_add(1);
+                for _ in 0..backspaces {
+                    keyboard.press_key(SpecialKey::Backspace)?;
+                }
+                keyboard.type_text(&accuracy_text)?;
+                keyboard.press_key(SpecialKey::Space)?;
+            } else {
+                eprintln!("[ACCURACY] No changes needed");
+            }
         }
     }
 
@@ -1905,6 +1994,78 @@ fn send_processing_notification(notifications: &DictationNotificationConfig) {
     if let Err(err) = notify("eaRS Dictation", message) {
         eprintln!("Failed to send processing notification: {}", err);
     }
+}
+
+#[cfg(feature = "llm-correct")]
+fn should_run_accuracy(args: &Args) -> bool {
+    if args.accuracy_url.trim().is_empty() {
+        return false;
+    }
+    match (args.accuracy_profile, args.correction_profile) {
+        (AccuracyProfileArg::Journal, CorrectionProfileArg::Journal) => true,
+        (AccuracyProfileArg::Technical, CorrectionProfileArg::Technical) => true,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "llm-correct")]
+async fn run_accuracy_pass(
+    accuracy_buffer: &Arc<Mutex<VecDeque<f32>>>,
+    args: &Args,
+) -> Result<Option<String>> {
+    let samples: Vec<f32> = {
+        let mut buf = accuracy_buffer.lock().unwrap();
+        let samples: Vec<f32> = buf.iter().copied().collect();
+        buf.clear();
+        samples
+    };
+    if samples.is_empty() {
+        return Ok(None);
+    }
+
+    let url = args.accuracy_url.trim();
+    let timeout = Duration::from_millis(args.accuracy_timeout_ms);
+    let (mut ws, _) = tokio::time::timeout(timeout, connect_async(url)).await??;
+
+    let chunk_size = 24_000 / 5; // 200ms
+    for chunk in samples.chunks(chunk_size) {
+        let bytes = f32_to_i16_bytes(chunk);
+        ws.send(Message::Binary(bytes.into())).await?;
+    }
+    ws.send(Message::Text("{\"type\":\"stop\"}".to_string().into()))
+        .await?;
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                    if json.get("type").and_then(|v| v.as_str()) == Some("final") {
+                        if let Some(result) = json.get("text").and_then(|v| v.as_str()) {
+                            return Ok(Some(result.to_string()));
+                        }
+                    }
+                }
+            }
+            Ok(Some(Ok(Message::Close(_)))) => break,
+            Ok(Some(Err(e))) => return Err(e.into()),
+            Ok(None) => break,
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "llm-correct")]
+fn f32_to_i16_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let v = (clamped * i16::MAX as f32) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 #[cfg(not(feature = "hooks"))]

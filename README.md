@@ -335,6 +335,10 @@ Typing delay controls (for apps that drop fast input):
 - `EARS_DELETE_WORD_DELAY_MS` (default `10`)
 - `EARS_CHORD_DELAY_MS` (default `5`)
 - `EARS_CAPTURE_GRACE_MS` (default `500`, keeps audio flowing briefly after toggle-off)
+- `EARS_ACCURACY_URL` (optional, e.g. `ws://127.0.0.1:8772/ws`)
+- `EARS_ACCURACY_PROFILE` (default `technical`)
+- `EARS_ACCURACY_TIMEOUT_MS` (default `6000`)
+- `EARS_ACCURACY_MAX_SECONDS` (default `60`)
 
 Helper script:
 
