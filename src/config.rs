@@ -134,6 +134,7 @@ pub struct DictationNotificationConfig {
     pub start_message: String,
     pub pause_message: String,
     pub stop_message: String,
+    pub processing_message: String,
 }
 
 impl Default for DictationNotificationConfig {
@@ -143,6 +144,7 @@ impl Default for DictationNotificationConfig {
             start_message: "Dictation enabled".to_string(),
             pause_message: "Dictation paused".to_string(),
             stop_message: "Dictation disabled".to_string(),
+            processing_message: "Processing final correction - pause speaking".to_string(),
         }
     }
 }

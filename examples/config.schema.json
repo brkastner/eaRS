@@ -201,6 +201,11 @@
               "type": "string",
               "default": "Dictation disabled",
               "description": "Message shown when dictation stops completely"
+            },
+            "processing_message": {
+              "type": "string",
+              "default": "Processing final correction - pause speaking",
+              "description": "Message shown when automatic processing starts"
             }
           },
           "additionalProperties": false

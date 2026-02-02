@@ -864,9 +864,11 @@ async fn main() -> Result<()> {
                                 #[cfg(feature = "preview-overlay")]
                                 if preview_mode {
                                     // Drain any remaining words to overlay
+                                    let drain_deadline = Instant::now()
+                                        + std::time::Duration::from_millis(800);
                                     loop {
                                         match tokio::time::timeout(
-                                            std::time::Duration::from_millis(100),
+                                            std::time::Duration::from_millis(120),
                                             read.next()
                                         ).await {
                                             Ok(Some(Ok(Message::Text(text)))) => {
@@ -883,7 +885,11 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             }
-                                            _ => break,
+                                            _ => {
+                                                if Instant::now() >= drain_deadline {
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                     // Run final correction through overlay
@@ -941,9 +947,11 @@ async fn main() -> Result<()> {
                                 #[cfg(feature = "preview-overlay")]
                                 if !preview_mode {
                                     // Drain any remaining words from websocket
+                                    let drain_deadline = Instant::now()
+                                        + std::time::Duration::from_millis(800);
                                     loop {
                                         match tokio::time::timeout(
-                                            std::time::Duration::from_millis(100),
+                                            std::time::Duration::from_millis(120),
                                             read.next()
                                         ).await {
                                             Ok(Some(Ok(Message::Text(text)))) => {
@@ -958,7 +966,11 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             }
-                                            _ => break,
+                                            _ => {
+                                                if Instant::now() >= drain_deadline {
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                     if correction_buffer.paragraph_len() >= 2 {
@@ -977,9 +989,11 @@ async fn main() -> Result<()> {
                                 // Non-preview-overlay build
                                 #[cfg(not(feature = "preview-overlay"))]
                                 {
+                                    let drain_deadline = Instant::now()
+                                        + std::time::Duration::from_millis(800);
                                     loop {
                                         match tokio::time::timeout(
-                                            std::time::Duration::from_millis(100),
+                                            std::time::Duration::from_millis(120),
                                             read.next()
                                         ).await {
                                             Ok(Some(Ok(Message::Text(text)))) => {
@@ -994,7 +1008,11 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             }
-                                            _ => break,
+                                            _ => {
+                                                if Instant::now() >= drain_deadline {
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                     if correction_buffer.paragraph_len() >= 2 {
@@ -1224,6 +1242,41 @@ async fn main() -> Result<()> {
                                         && correction_buffer.paragraph_len() >= 2
                                     {
                                         // 5+ second pause: final paragraph correction
+                                        send_processing_notification(&notification_config);
+                                        *capturing.lock().unwrap() = false;
+                                        eprintln!("[AUTO FINAL] pausing capture for processing");
+                                        let drain_deadline = Instant::now()
+                                            + std::time::Duration::from_millis(800);
+                                        loop {
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_millis(120),
+                                                read.next(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(Ok(Message::Text(text)))) => {
+                                                    if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                        if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                            let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                            if !word.is_empty() && has_alphanumeric {
+                                                                keyboard.type_text(word).ok();
+                                                                keyboard.press_key(SpecialKey::Space).ok();
+                                                                correction_buffer.add_word(word);
+                                                                last_word_time = Instant::now();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Ok(Some(Ok(Message::Close(_)))) => break,
+                                                Ok(Some(Err(_))) => break,
+                                                Ok(None) => break,
+                                                _ => {
+                                                    if Instant::now() >= drain_deadline {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         write_status("processing");
                                         if let Err(e) = correct_final_paragraph(
                                             &mut keyboard,
@@ -1233,6 +1286,7 @@ async fn main() -> Result<()> {
                                             eprintln!("[FINAL ERROR] {}", e);
                                         }
                                         write_status("listening");
+                                        *capturing.lock().unwrap() = true;
                                         last_word_time = Instant::now();
                                     } else if is_capturing && elapsed >= std::time::Duration::from_millis(1500)
                                         && correction_buffer.chunk_len() >= 2
@@ -1272,6 +1326,41 @@ async fn main() -> Result<()> {
                                         && correction_buffer.paragraph_len() >= 2
                                     {
                                         // 5+ second pause: final paragraph correction
+                                        send_processing_notification(&notification_config);
+                                        *capturing.lock().unwrap() = false;
+                                        eprintln!("[AUTO FINAL] pausing capture for processing");
+                                        let drain_deadline = Instant::now()
+                                            + std::time::Duration::from_millis(800);
+                                        loop {
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_millis(120),
+                                                read.next(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(Ok(Message::Text(text)))) => {
+                                                    if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                        if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                            let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                            if !word.is_empty() && has_alphanumeric {
+                                                                keyboard.type_text(word).ok();
+                                                                keyboard.press_key(SpecialKey::Space).ok();
+                                                                correction_buffer.add_word(word);
+                                                                last_word_time = Instant::now();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Ok(Some(Ok(Message::Close(_)))) => break,
+                                                Ok(Some(Err(_))) => break,
+                                                Ok(None) => break,
+                                                _ => {
+                                                    if Instant::now() >= drain_deadline {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
                                         write_status("processing");
                                         if let Err(e) = correct_final_paragraph(
                                             &mut keyboard,
@@ -1281,6 +1370,7 @@ async fn main() -> Result<()> {
                                             eprintln!("[FINAL ERROR] {}", e);
                                         }
                                         write_status("listening");
+                                        *capturing.lock().unwrap() = true;
                                         last_word_time = Instant::now();
                                     } else if is_capturing && elapsed >= std::time::Duration::from_millis(1500)
                                         && correction_buffer.chunk_len() >= 2
@@ -1491,6 +1581,7 @@ impl CorrectionBuffer {
 
 #[cfg(feature = "llm-correct")]
 fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfile) -> bool {
+    let filler_words = ["uh", "um", "erm", "uhh", "umm"];
     let normalize = |word: &str| {
         word.trim_matches(|c: char| !c.is_alphanumeric())
             .to_lowercase()
@@ -1499,12 +1590,12 @@ fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfil
     let original_words: Vec<String> = original
         .split_whitespace()
         .map(normalize)
-        .filter(|w| !w.is_empty())
+        .filter(|w| !w.is_empty() && !filler_words.contains(&w.as_str()))
         .collect();
     let corrected_words: Vec<String> = corrected
         .split_whitespace()
         .map(normalize)
-        .filter(|w| !w.is_empty())
+        .filter(|w| !w.is_empty() && !filler_words.contains(&w.as_str()))
         .collect();
 
     if original_words.is_empty() || corrected_words.is_empty() {
@@ -1515,7 +1606,7 @@ fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfil
     let corrected_len = corrected_words.len();
 
     let (min_ratio, max_ratio, base_threshold) = match profile {
-        CorrectionProfile::Journal => (0.8, 1.2, 0.85),
+        CorrectionProfile::Journal => (0.95, 1.05, 0.95),
         CorrectionProfile::Technical => (0.9, 1.1, 0.9),
     };
 
@@ -1529,7 +1620,7 @@ fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfil
     let overlap = original_set.intersection(&corrected_set).count();
     let overlap_ratio = overlap as f32 / original_set.len() as f32;
 
-    let threshold = if original_set.len() <= 3 { 0.6 } else { base_threshold };
+    let threshold = if original_set.len() <= 3 { 0.7 } else { base_threshold };
     overlap_ratio >= threshold
 }
 
@@ -1745,6 +1836,21 @@ fn send_toggle_notification(event: DictationEvent, notifications: &DictationNoti
 
     if let Err(err) = notify("eaRS Dictation", message) {
         eprintln!("Failed to send dictation notification: {}", err);
+    }
+}
+
+fn send_processing_notification(notifications: &DictationNotificationConfig) {
+    if !notifications.enabled {
+        return;
+    }
+
+    let message = notifications.processing_message.as_str();
+    if message.trim().is_empty() {
+        return;
+    }
+
+    if let Err(err) = notify("eaRS Dictation", message) {
+        eprintln!("Failed to send processing notification: {}", err);
     }
 }
 
