@@ -250,7 +250,7 @@ struct Args {
     #[arg(
         long,
         env = "EARS_ACCURACY_MAX_SECONDS",
-        default_value_t = 60,
+        default_value_t = 120,
         help = "Maximum audio seconds to keep for accuracy pass"
     )]
     accuracy_max_seconds: u64,
