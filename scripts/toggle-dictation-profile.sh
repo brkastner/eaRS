@@ -15,13 +15,13 @@ Options:
   --journal                  Shortcut for --profile journal.
   --technical                Shortcut for --profile technical.
   --status                   Print current profile and exit.
-  --ollama-autostart          Start ollama if not running (local only).
-  --ollama-preload            Preload the active model via API keep_alive.
+  --no-ollama-autostart        Disable automatic ollama start.
+  --no-preload                Disable model preload.
   --ollama-keep-alive <val>   keep_alive value (default: -1).
   --ollama-model <name>       Use one model for fast+final (single-model).
   --ollama-journal-model <n>  Single model for journal profile.
   --ollama-technical-model<n> Single model for technical profile.
-  --single-model              Use one model per profile (journal/technical).
+  --only                      Use one model per profile (journal/technical).
   -h, --help                  Show this help.
 
 If no profile is provided, the script toggles between journal and technical.
@@ -31,13 +31,13 @@ EOF
 profile_arg=""
 action="toggle"
 pass_args=()
-ollama_autostart=false
-ollama_preload=false
+ollama_autostart=true
+ollama_preload=true
 ollama_keep_alive="-1"
 ollama_model=""
 ollama_journal_model=""
 ollama_technical_model=""
-single_model=false
+only=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,12 +57,12 @@ while [[ $# -gt 0 ]]; do
       action="status"
       shift
       ;;
-    --ollama-autostart)
-      ollama_autostart=true
+    --no-ollama-autostart)
+      ollama_autostart=false
       shift
       ;;
-    --ollama-preload)
-      ollama_preload=true
+    --no-preload)
+      ollama_preload=false
       shift
       ;;
     --ollama-keep-alive)
@@ -81,8 +81,8 @@ while [[ $# -gt 0 ]]; do
       ollama_technical_model="${2:-}"
       shift 2
       ;;
-    --single-model)
-      single_model=true
+    --only)
+      only=true
       shift
       ;;
     --)
@@ -159,7 +159,7 @@ fi
 selected_model=""
 if [[ -n "$ollama_model" ]]; then
   selected_model="$ollama_model"
-elif $single_model; then
+elif $only; then
   if [[ "$profile" == "journal" && -n "$ollama_journal_model" ]]; then
     selected_model="$ollama_journal_model"
   elif [[ "$profile" == "technical" && -n "$ollama_technical_model" ]]; then
@@ -168,12 +168,37 @@ elif $single_model; then
     selected_model="$EARS_OLLAMA_MODEL_JOURNAL"
   elif [[ "$profile" == "technical" && -n "${EARS_OLLAMA_MODEL_TECHNICAL:-}" ]]; then
     selected_model="$EARS_OLLAMA_MODEL_TECHNICAL"
+  elif [[ "$profile" == "journal" ]]; then
+    selected_model="qwen2.5:7b"
+  else
+    selected_model="qwen2.5:32b-16k"
   fi
 fi
 
 if [[ -n "$selected_model" ]]; then
   export EARS_OLLAMA_MODEL_FAST="$selected_model"
   export EARS_OLLAMA_MODEL_FINAL="$selected_model"
+fi
+
+if $only && command -v ollama >/dev/null 2>&1; then
+  if [[ "$ollama_host" == "127.0.0.1" || "$ollama_host" == "localhost" || "$ollama_host" == "::1" ]]; then
+    stop_models=(
+      "$ollama_model"
+      "$ollama_journal_model"
+      "$ollama_technical_model"
+      "${EARS_OLLAMA_MODEL_FAST:-}"
+      "${EARS_OLLAMA_MODEL_FINAL:-}"
+      "${EARS_OLLAMA_MODEL_JOURNAL:-}"
+      "${EARS_OLLAMA_MODEL_TECHNICAL:-}"
+      "qwen2.5:7b"
+      "qwen2.5:32b-16k"
+    )
+    for model in "${stop_models[@]}"; do
+      [[ -z "$model" ]] && continue
+      [[ "$model" == "$selected_model" ]] && continue
+      ollama stop "$model" >/dev/null 2>&1 || true
+    done
+  fi
 fi
 
 if $ollama_preload; then

@@ -324,6 +324,8 @@ Environment variables:
 - `EARS_OLLAMA_NUM_PREDICT_FAST` (default `128`)
 - `EARS_OLLAMA_NUM_PREDICT_FINAL` (default `512`)
 - `EARS_CORRECTION_PROFILE` (default `journal`, options: `journal|technical`)
+- `EARS_OLLAMA_MODEL_JOURNAL` (optional, used by profile toggle when `--only`)
+- `EARS_OLLAMA_MODEL_TECHNICAL` (optional, used by profile toggle when `--only`)
 
 Typing delay controls (for apps that drop fast input):
 
@@ -352,8 +354,10 @@ Profile toggle script:
 Ollama helpers:
 
 ```bash
-./scripts/toggle-dictation-profile.sh --journal --ollama-autostart --ollama-preload --single-model
-./scripts/toggle-dictation-profile.sh --technical --ollama-preload --ollama-model qwen2.5:32b-16k
+./scripts/toggle-dictation-profile.sh --journal --only
+./scripts/toggle-dictation-profile.sh --technical --only
+./scripts/toggle-dictation-profile.sh --only --no-preload
+./scripts/toggle-dictation-profile.sh --technical --ollama-model qwen2.5:32b-16k
 ```
 
 ## Configuration
