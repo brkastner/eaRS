@@ -93,6 +93,10 @@ impl SentenceCorrector {
         })
     }
 
+    pub fn profile(&self) -> CorrectionProfile {
+        self.config.profile
+    }
+
     /// Add a word to the buffer.
     /// Returns (should_type_word, Option<correction>) where correction contains
     /// (backspace_count, corrected_text) if a sentence was completed and corrected.
@@ -159,13 +163,13 @@ impl SentenceCorrector {
     pub async fn correct_sentence(&self, sentence: &str) -> Result<String> {
         let prompt = match self.config.profile {
             CorrectionProfile::Journal => format!(
-                r#"Fix transcription errors and grammar in this dictated text. Common STT errors: "bath"→"batch", "B4"→"before", "uh"→remove. Remove filler words (uh, um) when they are standalone. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
+                r#"Fix transcription errors and punctuation in this dictated text. Do NOT paraphrase, summarize, or rephrase. Keep the original wording and word order; only fix recognition errors, casing, and punctuation. You may remove filler words (uh, um) only when they are standalone. If no changes are needed, return the input exactly. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
 
 Text: {}"#,
                 sentence
             ),
             CorrectionProfile::Technical => format!(
-                r#"Fix transcription errors and punctuation in this dictated text. Preserve code identifiers, file paths, flags, casing, and acronyms. Do not rewrite or normalize code-like tokens. Avoid stylistic rewrites. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
+                r#"Fix transcription errors and punctuation in this dictated text. Do NOT paraphrase or rephrase. Preserve code identifiers, file paths, flags, casing, and acronyms. Do not rewrite or normalize code-like tokens. Preserve all line breaks exactly. Output ONLY the corrected text, nothing else.
 
 Text: {}"#,
                 sentence
@@ -180,19 +184,15 @@ Text: {}"#,
     pub async fn correct_paragraph(&self, paragraph: &str) -> Result<String> {
         let prompt = match self.config.profile {
             CorrectionProfile::Journal => format!(
-                r#"Clean up this dictated paragraph. Fix:
-- Transcription errors (bath→batch, B4→before)
-- Grammar and punctuation
-- Remove filler words (uh, um)
-- Fix sentence boundaries
+                r#"Clean up this dictated paragraph. Do NOT paraphrase, summarize, or rephrase. Keep the original wording and sentence structure; only fix recognition errors, casing, and punctuation. You may remove filler words (uh, um) only when they are standalone. If no changes are needed, return the input exactly.
 IMPORTANT: Preserve all line breaks and paragraph structure exactly.
-Output ONLY the corrected text, preserving meaning.
+Output ONLY the corrected text.
 
 Text: {}"#,
                 paragraph
             ),
             CorrectionProfile::Technical => format!(
-                r#"Clean up this dictated paragraph. Fix transcription errors and punctuation while preserving meaning.
+                r#"Clean up this dictated paragraph. Fix transcription errors and punctuation only. Do NOT paraphrase or rephrase.
 IMPORTANT: Preserve code identifiers, file paths, flags, casing, and acronyms. Do not rewrite or normalize code-like tokens. Preserve all line breaks and paragraph structure exactly.
 Output ONLY the corrected text.
 

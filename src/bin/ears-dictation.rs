@@ -25,6 +25,7 @@ use std::fs;
 #[cfg(feature = "hooks")]
 use std::process::Command as ProcessCommand;
 #[cfg(feature = "llm-correct")]
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -46,7 +47,7 @@ enum EngineArg {
 }
 
 #[cfg(feature = "llm-correct")]
-#[derive(Clone, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum CorrectionProfileArg {
     Journal,
     Technical,
@@ -894,9 +895,13 @@ async fn main() -> Result<()> {
                                         let (paragraph, _word_count, _char_count) = correction_buffer.take_paragraph();
                                         match corrector.correct_paragraph(&paragraph).await {
                                             Ok(corrected) if corrected != paragraph => {
-                                                eprintln!("[TOGGLE-OFF FINAL] '{}' -> '{}'", paragraph, corrected);
-                                                if let Some(ref handle) = overlay_handle {
-                                                    let _ = handle.send_correction(corrected);
+                                                if !is_safe_correction(&paragraph, &corrected, args.correction_profile.into()) {
+                                                    eprintln!("[TOGGLE-OFF FINAL SKIP] low similarity");
+                                                } else {
+                                                    eprintln!("[TOGGLE-OFF FINAL] '{}' -> '{}'", paragraph, corrected);
+                                                    if let Some(ref handle) = overlay_handle {
+                                                        let _ = handle.send_correction(corrected);
+                                                    }
                                                 }
                                             }
                                             Ok(_) => {}
@@ -1050,12 +1055,13 @@ async fn main() -> Result<()> {
                                                     if is_capturing {
                                                         if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
                                                             last_word_time = Instant::now();
-                                                            if let Err(e) = handle_word_with_correction(
-                                                                word,
-                                                                &mut keyboard,
-                                                                &mut correction_buffer,
-                                                                &mut corrector,
-                                                            ).await {
+                                                     if let Err(e) = handle_word_with_correction(
+                                                         word,
+                                                         &mut keyboard,
+                                                         &mut correction_buffer,
+                                                         &mut corrector,
+                                                         args.correction_profile.into(),
+                                                     ).await {
                                                                 eprintln!("[ERROR] {}", e);
                                                             }
                                                         }
@@ -1081,6 +1087,7 @@ async fn main() -> Result<()> {
                                                                 &mut keyboard,
                                                                 &mut correction_buffer,
                                                                 &mut corrector,
+                                                                args.correction_profile.into(),
                                                             ).await {
                                                                 eprintln!("[ERROR] {}", e);
                                                             }
@@ -1128,7 +1135,7 @@ async fn main() -> Result<()> {
                                         && correction_buffer.chunk_len() >= 2
                                     {
                                         // 1.5+ second pause: chunk correction for preview
-                                        let (original, word_count, original_words) = correction_buffer.take_chunk();
+                                        let (original, word_count, _char_count, original_words) = correction_buffer.take_chunk();
                                         let chunk_start = overlay_word_count.saturating_sub(word_count);
                                         if let Some(ref handle) = overlay_handle {
                                             let _ = handle.set_status(OverlayStatus::Correcting);
@@ -1171,14 +1178,18 @@ async fn main() -> Result<()> {
                                         // Apply correction result
                                         if let Some(Ok(corrected)) = correction_result {
                                             if corrected != original {
-                                                eprintln!("[PREVIEW CHUNK] '{}' -> '{}'", original, corrected);
-                                                if let Some(ref handle) = overlay_handle {
-                                                    if let Err(e) = handle.send_chunk_correction(&corrected, chunk_start, word_count) {
-                                                        eprintln!("[PREVIEW CORRECTION ERROR] {}", e);
+                                                if !is_safe_correction(&original, &corrected, args.correction_profile.into()) {
+                                                    eprintln!("[PREVIEW CHUNK SKIP] low similarity");
+                                                } else {
+                                                    eprintln!("[PREVIEW CHUNK] '{}' -> '{}'", original, corrected);
+                                                    if let Some(ref handle) = overlay_handle {
+                                                        if let Err(e) = handle.send_chunk_correction(&corrected, chunk_start, word_count) {
+                                                            eprintln!("[PREVIEW CORRECTION ERROR] {}", e);
+                                                        }
                                                     }
+                                                    // Keep paragraph_words in sync with corrected text
+                                                    correction_buffer.apply_chunk_correction(&original_words, &corrected);
                                                 }
-                                                // Keep paragraph_words in sync with corrected text
-                                                correction_buffer.apply_chunk_correction(&original_words, &corrected);
                                             }
                                         } else if let Some(Err(e)) = correction_result {
                                             eprintln!("[PREVIEW CHUNK ERROR] {}", e);
@@ -1227,14 +1238,21 @@ async fn main() -> Result<()> {
                                         && correction_buffer.chunk_len() >= 2
                                     {
                                         // 1.5+ second pause: chunk correction
-                                        let (original, word_count, original_words) = correction_buffer.take_chunk();
+                                        let (original, _word_count, char_count, original_words) = correction_buffer.take_chunk();
                                         write_status("processing");
                                         match corrector.correct_sentence(&original).await {
                                             Ok(corrected) if corrected != original => {
+                                                if !is_safe_correction(&original, &corrected, args.correction_profile.into()) {
+                                                    eprintln!("[PAUSE CHUNK SKIP] low similarity");
+                                                    write_status("listening");
+                                                    last_word_time = Instant::now();
+                                                    continue;
+                                                }
                                                 eprintln!("[PAUSE CHUNK] '{}' -> '{}'", original, corrected);
-                                                // Delete trailing space first, then delete words
-                                                keyboard.press_key(SpecialKey::Backspace)?;
-                                                keyboard.delete_words(word_count)?;
+                                                let total_backspaces = char_count.saturating_add(1);
+                                                for _ in 0..total_backspaces {
+                                                    keyboard.press_key(SpecialKey::Backspace)?;
+                                                }
                                                 keyboard.type_text(&corrected)?;
                                                 keyboard.press_key(SpecialKey::Space)?;
                                                 correction_buffer.apply_chunk_correction(&original_words, &corrected);
@@ -1268,14 +1286,21 @@ async fn main() -> Result<()> {
                                         && correction_buffer.chunk_len() >= 2
                                     {
                                         // 1.5+ second pause: chunk correction
-                                        let (original, word_count, original_words) = correction_buffer.take_chunk();
+                                        let (original, _word_count, char_count, original_words) = correction_buffer.take_chunk();
                                         write_status("processing");
                                         match corrector.correct_sentence(&original).await {
                                             Ok(corrected) if corrected != original => {
+                                                if !is_safe_correction(&original, &corrected, args.correction_profile.into()) {
+                                                    eprintln!("[PAUSE CHUNK SKIP] low similarity");
+                                                    write_status("listening");
+                                                    last_word_time = Instant::now();
+                                                    continue;
+                                                }
                                                 eprintln!("[PAUSE CHUNK] '{}' -> '{}'", original, corrected);
-                                                // Delete trailing space first, then delete words
-                                                keyboard.press_key(SpecialKey::Backspace)?;
-                                                keyboard.delete_words(word_count)?;
+                                                let total_backspaces = char_count.saturating_add(1);
+                                                for _ in 0..total_backspaces {
+                                                    keyboard.press_key(SpecialKey::Backspace)?;
+                                                }
                                                 keyboard.type_text(&corrected)?;
                                                 keyboard.press_key(SpecialKey::Space)?;
                                                 correction_buffer.apply_chunk_correction(&original_words, &corrected);
@@ -1378,12 +1403,13 @@ impl CorrectionBuffer {
         self.paragraph_words.push(word.to_string());
     }
 
-    fn take_chunk(&mut self) -> (String, usize, Vec<String>) {
+    fn take_chunk(&mut self) -> (String, usize, usize, Vec<String>) {
         let text = self.chunk_words.join(" ");
         let word_count = self.chunk_words.len();
+        let char_count = self.chunk_char_count;
         let words = std::mem::take(&mut self.chunk_words);
         self.chunk_char_count = 0;
-        (text, word_count, words)
+        (text, word_count, char_count, words)
     }
 
     fn take_paragraph(&mut self) -> (String, usize, usize) {
@@ -1452,6 +1478,52 @@ impl CorrectionBuffer {
     }
 }
 
+#[cfg(feature = "llm-correct")]
+fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfile) -> bool {
+    let normalize = |word: &str| {
+        word.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+
+    let original_words: Vec<String> = original
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+    let corrected_words: Vec<String> = corrected
+        .split_whitespace()
+        .map(normalize)
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    if original_words.is_empty() || corrected_words.is_empty() {
+        return false;
+    }
+
+    let original_len = original_words.len();
+    let corrected_len = corrected_words.len();
+
+    let max_ratio = 1.5;
+    let min_ratio = 0.5;
+    let len_ratio = corrected_len as f32 / original_len as f32;
+    if len_ratio > max_ratio || len_ratio < min_ratio {
+        return false;
+    }
+
+    let original_set: HashSet<String> = original_words.into_iter().collect();
+    let corrected_set: HashSet<String> = corrected_words.into_iter().collect();
+    let overlap = original_set.intersection(&corrected_set).count();
+    let overlap_ratio = overlap as f32 / original_set.len() as f32;
+
+    let base_threshold = match profile {
+        CorrectionProfile::Journal => 0.7,
+        CorrectionProfile::Technical => 0.85,
+    };
+
+    let threshold = if original_set.len() <= 3 { 0.5 } else { base_threshold };
+    overlap_ratio >= threshold
+}
+
 #[cfg(not(feature = "llm-correct"))]
 fn handle_message(
     json: &Value,
@@ -1491,6 +1563,7 @@ async fn handle_word_with_correction(
     keyboard: &mut Box<dyn VirtualKeyboard>,
     buffer: &mut CorrectionBuffer,
     corrector: &mut SentenceCorrector,
+    profile: CorrectionProfile,
 ) -> Result<()> {
     // Skip empty words and punctuation-only words
     let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
@@ -1505,16 +1578,22 @@ async fn handle_word_with_correction(
 
     // Check if we should correct this chunk
     if buffer.should_correct_chunk(word) && buffer.chunk_len() >= 2 {
-        let (original, word_count, original_words) = buffer.take_chunk();
+        let (original, _word_count, char_count, original_words) = buffer.take_chunk();
 
         // Get correction from LLM
         match corrector.correct_sentence(&original).await {
             Ok(corrected) if corrected != original => {
+                if !is_safe_correction(&original, &corrected, profile) {
+                    eprintln!("[CHUNK SKIP] low similarity");
+                    return Ok(());
+                }
                 eprintln!("[CHUNK] '{}' -> '{}'", original, corrected);
 
-                // Delete trailing space first, then delete words with Ctrl+Backspace
-                keyboard.press_key(SpecialKey::Backspace)?;
-                keyboard.delete_words(word_count)?;
+                // Delete trailing space plus typed characters to avoid word-boundary issues
+                let total_backspaces = char_count.saturating_add(1);
+                for _ in 0..total_backspaces {
+                    keyboard.press_key(SpecialKey::Backspace)?;
+                }
 
                 // Type corrected text
                 keyboard.type_text(&corrected)?;
@@ -1552,6 +1631,10 @@ async fn correct_final_paragraph(
 
     match corrector.correct_paragraph(&original).await {
         Ok(corrected) if corrected != original => {
+            if !is_safe_correction(&original, &corrected, corrector.profile()) {
+                eprintln!("[FINAL SKIP] low similarity");
+                return Ok(());
+            }
             eprintln!("[FINAL] '{}' -> '{}'", original, corrected);
 
             // Delete trailing space plus typed characters to avoid word-boundary issues
