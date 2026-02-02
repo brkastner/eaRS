@@ -357,6 +357,16 @@ Gateway auto-start (default):
   start `asr-gateway` using `just` from `$HOME/dev/asr-gateway`.
 - Disable with `--no-gateway-autostart`.
 
+ears-server auto-start (default):
+
+- If the upstream server URL is local, the script will start `ears server start`.
+- Override with:
+  - `EARS_SERVER_BIN` (default `$ROOT/target/release/ears`)
+  - `EARS_SERVER_ENGINE` (default `parakeet`)
+  - `EARS_SERVER_DEVICE` (default `amd`)
+  - `EARS_SERVER_BIND` (default `0.0.0.0:<upstream-port>`)
+- Disable with `--no-ears-server-autostart`.
+
 Ollama helpers:
 
 ```bash

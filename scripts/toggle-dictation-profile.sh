@@ -23,6 +23,7 @@ Options:
   --ollama-technical-model<n> Single model for technical profile.
   --only                      Use one model per profile (journal/technical).
   --no-gateway-autostart       Disable gateway auto-start.
+  --no-ears-server-autostart   Disable ears-server auto-start.
   -h, --help                  Show this help.
 
 If no profile is provided, the script toggles between journal and technical.
@@ -40,6 +41,7 @@ ollama_journal_model=""
 ollama_technical_model=""
 only=false
 gateway_autostart=true
+ears_server_autostart=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -89,6 +91,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-gateway-autostart)
       gateway_autostart=false
+      shift
+      ;;
+    --no-ears-server-autostart)
+      ears_server_autostart=false
       shift
       ;;
     --)
@@ -160,6 +166,85 @@ check_tcp() {
   fi
   (echo > "/dev/tcp/$host/$port") >/dev/null 2>&1
 }
+
+get_env_value() {
+  local key="$1"
+  local file="$2"
+  local line
+  line="$(grep -E "^[[:space:]]*${key}=" "$file" 2>/dev/null | tail -n1 || true)"
+  if [[ -z "$line" ]]; then
+    return 1
+  fi
+  local value="${line#*=}"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  echo "$value"
+  return 0
+}
+
+start_ears_server_if_needed() {
+  local upstream_url="$1"
+  local upstream_hostport="${upstream_url#*://}"
+  upstream_hostport="${upstream_hostport%%/*}"
+  local upstream_host="${upstream_hostport%%:*}"
+  local upstream_port="${upstream_hostport##*:}"
+
+  if [[ "$upstream_host" != "127.0.0.1" && "$upstream_host" != "localhost" && "$upstream_host" != "::1" ]]; then
+    return 0
+  fi
+
+  if check_tcp "$upstream_host" "$upstream_port"; then
+    return 0
+  fi
+
+  local ears_bin="${EARS_SERVER_BIN:-$ROOT/target/release/ears}"
+  local engine="${EARS_SERVER_ENGINE:-parakeet}"
+  local device="${EARS_SERVER_DEVICE:-amd}"
+  local bind="${EARS_SERVER_BIND:-0.0.0.0:$upstream_port}"
+
+  if [[ ! -x "$ears_bin" ]]; then
+    echo "ears binary not found at $ears_bin" >&2
+    return 1
+  fi
+
+  args=(server start --engine "$engine" --bind "$bind")
+  if [[ "$engine" == "parakeet" ]]; then
+    args+=(--parakeet-device "$device")
+  fi
+
+  "$ears_bin" "${args[@]}" >/dev/null 2>&1 || true
+}
+
+upstream_url=""
+if [[ "$server_port" == "8770" ]]; then
+  if [[ -n "${EARS_SERVER_URL_JOURNAL:-}" ]]; then
+    upstream_url="$EARS_SERVER_URL_JOURNAL"
+  else
+    env_file="${ASR_GATEWAY_DIR:-$HOME/dev/asr-gateway}/.env"
+    if [[ -f "$env_file" ]]; then
+      upstream_url="$(get_env_value EARS_SERVER_URL_JOURNAL "$env_file" || true)"
+    fi
+  fi
+elif [[ "$server_port" == "8771" ]]; then
+  if [[ -n "${EARS_SERVER_URL_TECHNICAL:-}" ]]; then
+    upstream_url="$EARS_SERVER_URL_TECHNICAL"
+  else
+    env_file="${ASR_GATEWAY_DIR:-$HOME/dev/asr-gateway}/.env"
+    if [[ -f "$env_file" ]]; then
+      upstream_url="$(get_env_value EARS_SERVER_URL_TECHNICAL "$env_file" || true)"
+    fi
+  fi
+fi
+
+if [[ -z "$upstream_url" ]]; then
+  upstream_url="$server_url"
+fi
+
+if $ears_server_autostart; then
+  start_ears_server_if_needed "$upstream_url" || true
+fi
 
 if $gateway_autostart; then
   if [[ "$server_host" == "127.0.0.1" || "$server_host" == "localhost" || "$server_host" == "::1" ]]; then
