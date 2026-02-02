@@ -341,6 +341,14 @@ Helper script:
 
 The script reads `./.env` if present and exports the `EARS_OLLAMA_*` variables.
 
+Profile toggle script:
+
+```bash
+./scripts/toggle-dictation-profile.sh --journal
+./scripts/toggle-dictation-profile.sh --technical
+./scripts/toggle-dictation-profile.sh   # toggles between profiles
+```
+
 ## Configuration
 
 Runtime configuration lives at:
