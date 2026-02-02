@@ -8,14 +8,21 @@ PID_FILE="$STATE_DIR/dictation.pid"
 
 usage() {
   cat <<'EOF'
-Usage: toggle-dictation-profile.sh [--profile journal|technical] [--status] [-- <dictation args>]
+Usage: toggle-dictation-profile.sh [options] [-- <dictation args>]
 
 Options:
-  --profile <name>  Start dictation with explicit profile.
-  --status          Print current profile and exit.
-  --journal         Shortcut for --profile journal.
-  --technical       Shortcut for --profile technical.
-  -h, --help        Show this help.
+  --profile <name>           Start dictation with explicit profile.
+  --journal                  Shortcut for --profile journal.
+  --technical                Shortcut for --profile technical.
+  --status                   Print current profile and exit.
+  --ollama-autostart          Start ollama if not running (local only).
+  --ollama-preload            Preload the active model via API keep_alive.
+  --ollama-keep-alive <val>   keep_alive value (default: -1).
+  --ollama-model <name>       Use one model for fast+final (single-model).
+  --ollama-journal-model <n>  Single model for journal profile.
+  --ollama-technical-model<n> Single model for technical profile.
+  --single-model              Use one model per profile (journal/technical).
+  -h, --help                  Show this help.
 
 If no profile is provided, the script toggles between journal and technical.
 EOF
@@ -24,6 +31,13 @@ EOF
 profile_arg=""
 action="toggle"
 pass_args=()
+ollama_autostart=false
+ollama_preload=false
+ollama_keep_alive="-1"
+ollama_model=""
+ollama_journal_model=""
+ollama_technical_model=""
+single_model=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,6 +55,34 @@ while [[ $# -gt 0 ]]; do
       ;;
     --status)
       action="status"
+      shift
+      ;;
+    --ollama-autostart)
+      ollama_autostart=true
+      shift
+      ;;
+    --ollama-preload)
+      ollama_preload=true
+      shift
+      ;;
+    --ollama-keep-alive)
+      ollama_keep_alive="${2:-}"
+      shift 2
+      ;;
+    --ollama-model)
+      ollama_model="${2:-}"
+      shift 2
+      ;;
+    --ollama-journal-model)
+      ollama_journal_model="${2:-}"
+      shift 2
+      ;;
+    --ollama-technical-model)
+      ollama_technical_model="${2:-}"
+      shift 2
+      ;;
+    --single-model)
+      single_model=true
       shift
       ;;
     --)
@@ -88,6 +130,64 @@ if [[ "$profile" != "journal" && "$profile" != "technical" ]]; then
 fi
 
 echo "$profile" > "$PROFILE_FILE"
+
+ollama_url="${EARS_OLLAMA_URL:-http://127.0.0.1:11434}"
+ollama_host="${ollama_url#*://}"
+ollama_host="${ollama_host%%/*}"
+ollama_host="${ollama_host%%:*}"
+
+if $ollama_autostart; then
+  if [[ "$ollama_host" == "127.0.0.1" || "$ollama_host" == "localhost" || "$ollama_host" == "::1" ]]; then
+    if ! curl -s "$ollama_url/api/tags" >/dev/null 2>&1; then
+      if command -v ollama >/dev/null 2>&1; then
+        nohup ollama serve >/tmp/ollama-serve.log 2>&1 &
+        for _ in {1..20}; do
+          if curl -s "$ollama_url/api/tags" >/dev/null 2>&1; then
+            break
+          fi
+          sleep 0.2
+        done
+      else
+        echo "ollama not found in PATH" >&2
+      fi
+    fi
+  else
+    echo "ollama-autostart skipped (non-local EARS_OLLAMA_URL: $ollama_url)" >&2
+  fi
+fi
+
+selected_model=""
+if [[ -n "$ollama_model" ]]; then
+  selected_model="$ollama_model"
+elif $single_model; then
+  if [[ "$profile" == "journal" && -n "$ollama_journal_model" ]]; then
+    selected_model="$ollama_journal_model"
+  elif [[ "$profile" == "technical" && -n "$ollama_technical_model" ]]; then
+    selected_model="$ollama_technical_model"
+  elif [[ "$profile" == "journal" && -n "${EARS_OLLAMA_MODEL_JOURNAL:-}" ]]; then
+    selected_model="$EARS_OLLAMA_MODEL_JOURNAL"
+  elif [[ "$profile" == "technical" && -n "${EARS_OLLAMA_MODEL_TECHNICAL:-}" ]]; then
+    selected_model="$EARS_OLLAMA_MODEL_TECHNICAL"
+  fi
+fi
+
+if [[ -n "$selected_model" ]]; then
+  export EARS_OLLAMA_MODEL_FAST="$selected_model"
+  export EARS_OLLAMA_MODEL_FINAL="$selected_model"
+fi
+
+if $ollama_preload; then
+  preload_model="$selected_model"
+  if [[ -z "$preload_model" ]]; then
+    preload_model="${EARS_OLLAMA_MODEL_FINAL:-${EARS_OLLAMA_MODEL_FAST:-}}"
+  fi
+  if [[ -n "$preload_model" ]]; then
+    curl -s "$ollama_url/api/generate" \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"$preload_model\",\"keep_alive\":$ollama_keep_alive}" \
+      >/dev/null 2>&1 || true
+  fi
+fi
 
 if [[ -f "$PID_FILE" ]]; then
   pid="$(cat "$PID_FILE" 2>/dev/null || true)"

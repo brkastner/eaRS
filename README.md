@@ -349,6 +349,13 @@ Profile toggle script:
 ./scripts/toggle-dictation-profile.sh   # toggles between profiles
 ```
 
+Ollama helpers:
+
+```bash
+./scripts/toggle-dictation-profile.sh --journal --ollama-autostart --ollama-preload --single-model
+./scripts/toggle-dictation-profile.sh --technical --ollama-preload --ollama-model qwen2.5:32b-16k
+```
+
 ## Configuration
 
 Runtime configuration lives at:
