@@ -317,6 +317,7 @@ struct OverlayState {
     review_options: Vec<ReviewOption>,
     review_selected: usize,
     response_tx: Sender<OverlayResponse>,
+    scrolled: ScrolledWindow,
     content_box: GtkBox,
     status_label: Label,
     info_label: Label,
@@ -373,6 +374,7 @@ impl OverlayState {
         // Update word count
         self.word_count_label
             .set_label(&format!("{} words", self.buffer.active_word_count()));
+        self.scroll_to_bottom();
     }
 
     fn update_review_display(&self) {
@@ -414,6 +416,16 @@ impl OverlayState {
             item.append(&text);
             self.content_box.append(&item);
         }
+        self.scroll_to_bottom();
+    }
+
+    fn scroll_to_bottom(&self) {
+        let adjustment = self.scrolled.vadjustment();
+        let upper = adjustment.upper();
+        let page_size = adjustment.page_size();
+        let lower = adjustment.lower();
+        let target = (upper - page_size).max(lower);
+        adjustment.set_value(target);
     }
 
     fn update_status_display(&self) {
@@ -458,10 +470,10 @@ fn build_window(
     window.set_layer(gtk4_layer_shell::Layer::Overlay);
     window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
 
-    let default_width = window_width as i32;
-    let default_height = window_height as i32;
-    let mut monitor_width = default_width + 64;
-    let mut monitor_height = default_height + 64;
+    let base_width = (window_width as i32) * 2;
+    let base_height = (window_height as i32) * 2;
+    let mut monitor_width = base_width + 64;
+    let mut monitor_height = base_height + 64;
 
     if let Some(display) = gtk4::gdk::Display::default() {
         let monitor = display.monitors().item(0).and_downcast::<gtk4::gdk::Monitor>();
@@ -471,6 +483,11 @@ fn build_window(
             monitor_height = geometry.height();
         }
     }
+
+    let max_default_width = (monitor_width - 40).max(200);
+    let max_default_height = (monitor_height - 40).max(200);
+    let default_width = base_width.min(max_default_width);
+    let default_height = base_height.min(max_default_height);
 
     let review_width = ((monitor_width as f32) * 0.50) as i32;
     let review_height = ((monitor_height as f32) * 0.50) as i32;
@@ -550,6 +567,7 @@ fn build_window(
         review_options: Vec::new(),
         review_selected: 0,
         response_tx,
+        scrolled: scrolled.clone(),
         content_box,
         status_label,
         info_label,
