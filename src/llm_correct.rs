@@ -248,8 +248,88 @@ Text: {}"#,
             .trim_matches('"')
             .to_string();
 
-        Ok(corrected)
+        Ok(strip_leading_preamble(&corrected))
     }
+}
+
+fn strip_leading_preamble(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let mut first_idx = None;
+    for (idx, line) in lines.iter().enumerate() {
+        if !line.trim().is_empty() {
+            first_idx = Some(idx);
+            break;
+        }
+    }
+
+    let Some(idx) = first_idx else {
+        return String::new();
+    };
+
+    let first_line = lines[idx].trim();
+    let first_lower = first_line.to_ascii_lowercase();
+    if !is_preamble_line(&first_lower) {
+        return trimmed.to_string();
+    }
+
+    let mut output = String::new();
+    let mut has_content = false;
+
+    if let Some(colon_pos) = first_line.find(':') {
+        let after = first_line[colon_pos + 1..].trim();
+        if !after.is_empty() {
+            output.push_str(after);
+            has_content = true;
+        }
+    }
+
+    for line in lines.iter().skip(idx + 1) {
+        if has_content {
+            output.push('\n');
+        }
+        output.push_str(line);
+        has_content = true;
+    }
+
+    output.trim().to_string()
+}
+
+fn is_preamble_line(line_lower: &str) -> bool {
+    let prefixes = [
+        "here is the corrected text",
+        "here's the corrected text",
+        "corrected text",
+        "corrected",
+        "correction",
+        "output",
+        "revised text",
+        "revised",
+        "fixed text",
+        "fixed",
+        "final text",
+        "final",
+        "rewritten text",
+        "rewrite",
+    ];
+
+    for prefix in prefixes {
+        if line_lower == prefix {
+            return true;
+        }
+        if line_lower.starts_with(prefix) {
+            let rest = line_lower[prefix.len()..].trim_start();
+            if rest.starts_with(':') {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Check if Ollama is available at the given endpoint

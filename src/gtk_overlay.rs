@@ -6,7 +6,9 @@
 use crate::preview_buffer::{DisplayStyle, PreviewBuffer};
 use anyhow::Result;
 use async_channel::{Receiver as AsyncReceiver, Sender as AsyncSender};
+use gtk4::gdk;
 use gtk4::glib;
+use gtk4::glib::prelude::CastNone;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, CssProvider, Label, Orientation, ScrolledWindow,
@@ -35,8 +37,14 @@ pub enum OverlayCommand {
     Commit,
     /// Close the overlay without committing
     Close,
+    /// Show the overlay window
+    Show,
+    /// Hide the overlay window
+    Hide,
     /// Update the status indicator
     Status(OverlayStatus),
+    /// Update the info text
+    Info(String),
 }
 
 /// Status indicator for the overlay
@@ -122,11 +130,33 @@ impl OverlayHandle {
             .map_err(|e| anyhow::anyhow!("Failed to send status to overlay: {}", e))
     }
 
+    /// Update the info text
+    pub fn set_info(&self, info: String) -> Result<()> {
+        self.command_tx
+            .send_blocking(OverlayCommand::Info(info))
+            .map_err(|e| anyhow::anyhow!("Failed to send info to overlay: {}", e))
+    }
+
+
     /// Close the overlay
     pub fn close(&self) -> Result<()> {
         self.command_tx
             .send_blocking(OverlayCommand::Close)
             .map_err(|e| anyhow::anyhow!("Failed to send close to overlay: {}", e))
+    }
+
+    /// Show the overlay window
+    pub fn show(&self) -> Result<()> {
+        self.command_tx
+            .send_blocking(OverlayCommand::Show)
+            .map_err(|e| anyhow::anyhow!("Failed to send show to overlay: {}", e))
+    }
+
+    /// Hide the overlay window
+    pub fn hide(&self) -> Result<()> {
+        self.command_tx
+            .send_blocking(OverlayCommand::Hide)
+            .map_err(|e| anyhow::anyhow!("Failed to send hide to overlay: {}", e))
     }
 
     /// Check for a response (non-blocking)
@@ -185,6 +215,12 @@ window {
     font-size: 13px;
 }
 
+
+.info-text {
+    color: rgba(160, 160, 160, 0.9);
+    font-size: 12px;
+}
+
 separator {
     background-color: rgba(80, 80, 80, 0.5);
     min-height: 1px;
@@ -210,6 +246,7 @@ struct OverlayState {
     response_tx: Sender<OverlayResponse>,
     content_box: GtkBox,
     status_label: Label,
+    info_label: Label,
     word_count_label: Label,
 }
 
@@ -273,6 +310,10 @@ impl OverlayState {
         self.status_label.add_css_class(class);
         self.status_label.set_label(self.status.as_str());
     }
+
+    fn update_info(&self, info: &str) {
+        self.info_label.set_label(info);
+    }
 }
 
 fn build_window(
@@ -294,11 +335,31 @@ fn build_window(
     window.set_layer(gtk4_layer_shell::Layer::Overlay);
     window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
 
-    // Position at bottom-right with margins
-    window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
-    window.set_anchor(gtk4_layer_shell::Edge::Right, true);
-    window.set_margin(gtk4_layer_shell::Edge::Bottom, 32);
-    window.set_margin(gtk4_layer_shell::Edge::Right, 32);
+    // Position at center of the primary monitor
+    if let Some(display) = gtk4::gdk::Display::default() {
+        let monitor = display.monitors().item(0).and_downcast::<gtk4::gdk::Monitor>();
+        if let Some(monitor) = monitor {
+            let geometry = monitor.geometry();
+            let offset_x = ((geometry.width() - window_width as i32) / 2).max(0);
+            let offset_y = ((geometry.height() - window_height as i32) / 2).max(0);
+            window.set_anchor(gtk4_layer_shell::Edge::Top, true);
+            window.set_anchor(gtk4_layer_shell::Edge::Left, true);
+            window.set_anchor(gtk4_layer_shell::Edge::Bottom, false);
+            window.set_anchor(gtk4_layer_shell::Edge::Right, false);
+            window.set_margin(gtk4_layer_shell::Edge::Left, offset_x);
+            window.set_margin(gtk4_layer_shell::Edge::Top, offset_y);
+        } else {
+            window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
+            window.set_anchor(gtk4_layer_shell::Edge::Right, true);
+            window.set_margin(gtk4_layer_shell::Edge::Bottom, 32);
+            window.set_margin(gtk4_layer_shell::Edge::Right, 32);
+        }
+    } else {
+        window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
+        window.set_anchor(gtk4_layer_shell::Edge::Right, true);
+        window.set_margin(gtk4_layer_shell::Edge::Bottom, 32);
+        window.set_margin(gtk4_layer_shell::Edge::Right, 32);
+    }
 
     // Set namespace for compositor identification
     window.set_namespace("eaRS-dictation-overlay");
@@ -317,6 +378,17 @@ fn build_window(
     let content_box = GtkBox::new(Orientation::Vertical, 4);
     content_box.add_css_class("content-box");
     scrolled.set_child(Some(&content_box));
+
+    // Info line
+    let info_label = Label::new(Some(""));
+    info_label.add_css_class("info-text");
+    info_label.set_halign(gtk4::Align::Start);
+    info_label.set_xalign(0.0);
+    info_label.set_wrap(true);
+    info_label.set_margin_start(12);
+    info_label.set_margin_end(12);
+    info_label.set_margin_top(4);
+    info_label.set_margin_bottom(2);
 
     // Status bar at bottom
     let status_bar = GtkBox::new(Orientation::Horizontal, 8);
@@ -337,6 +409,7 @@ fn build_window(
     status_bar.append(&word_count_label);
 
     main_box.append(&scrolled);
+    main_box.append(&info_label);
     main_box.append(&status_bar);
     window.set_child(Some(&main_box));
 
@@ -347,6 +420,7 @@ fn build_window(
         response_tx,
         content_box,
         status_label,
+        info_label,
         word_count_label,
     }));
 
@@ -383,20 +457,31 @@ fn build_window(
                     if let Some(text) = state.buffer.commit() {
                         let _ = state.response_tx.send(OverlayResponse::PasteText(text));
                     }
-                    let _ = state.response_tx.send(OverlayResponse::Closed);
+                    state.update_display();
                     drop(state);
-                    window_clone.close();
-                    break;
+                    window_clone.set_visible(false);
                 }
                 OverlayCommand::Close => {
-                    let _ = state.response_tx.send(OverlayResponse::Closed);
+                    state.buffer.clear();
+                    state.update_display();
                     drop(state);
-                    window_clone.close();
-                    break;
+                    window_clone.set_visible(false);
                 }
                 OverlayCommand::Status(status) => {
                     state.status = status;
                     state.update_status_display();
+                }
+                OverlayCommand::Info(info) => {
+                    state.update_info(&info);
+                }
+                OverlayCommand::Show => {
+                    drop(state);
+                    window_clone.set_visible(true);
+                    window_clone.present();
+                }
+                OverlayCommand::Hide => {
+                    drop(state);
+                    window_clone.set_visible(false);
                 }
             }
         }
@@ -404,10 +489,14 @@ fn build_window(
 
     // Handle window close
     let state_close = state.clone();
+    let window_close = window.clone();
     window.connect_close_request(move |_| {
-        let state = state_close.borrow();
-        let _ = state.response_tx.send(OverlayResponse::Closed);
-        glib::Propagation::Proceed
+        let mut state = state_close.borrow_mut();
+        state.buffer.clear();
+        state.update_display();
+        drop(state);
+        window_close.set_visible(false);
+        glib::Propagation::Stop
     });
 
     window.present();

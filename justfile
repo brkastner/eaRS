@@ -6,13 +6,9 @@ help:
 
 # === Build ===
 
-# Debug build
+# Build (release + preview overlay)
 build:
-    cargo build
-
-# Release build
-build-release:
-    cargo build --release
+    cargo build --release --features "parakeet,amd,llm-correct,hooks,preview-overlay"
 
 # Check compilation without building
 check:

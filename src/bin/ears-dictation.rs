@@ -10,6 +10,7 @@ use ears::llm_correct::{CorrectionProfile, LlmCorrectConfig, SentenceCorrector};
 use ears::virtual_keyboard::{
     create_virtual_keyboard_with_timing,
     KeyboardTiming,
+    NewlineMode,
     VirtualKeyboard,
     SpecialKey,
 };
@@ -27,8 +28,10 @@ use std::process::Command as ProcessCommand;
 #[cfg(feature = "llm-correct")]
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::env;
 use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
@@ -39,6 +42,218 @@ const STATUS_FILE_NAME: &str = "status.json";
 
 #[cfg(all(feature = "preview-overlay", feature = "llm-correct"))]
 const AUTO_COMMIT_PAUSE_SECS: u64 = 10;
+
+fn parse_newline_mode() -> NewlineMode {
+    match env::var("EARS_NEWLINE_MODE").ok().as_deref() {
+        Some("shift-enter") | Some("shift+enter") | Some("shift") => NewlineMode::ShiftEnter,
+        _ => NewlineMode::Enter,
+    }
+}
+
+#[cfg(feature = "llm-correct")]
+fn should_log_rejected_corrections() -> bool {
+    matches!(
+        env::var("EARS_LOG_REJECTED_CORRECTIONS").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+#[cfg(feature = "llm-correct")]
+fn should_disable_chunk_correction(profile: CorrectionProfile) -> bool {
+    if !matches!(profile, CorrectionProfile::Technical) {
+        return false;
+    }
+    matches!(
+        env::var("EARS_DISABLE_CHUNK_CORRECTION").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+#[cfg(feature = "llm-correct")]
+fn parse_env_f32(key: &str, default_value: f32) -> f32 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(default_value)
+}
+
+#[cfg(feature = "llm-correct")]
+fn correction_thresholds(profile: CorrectionProfile) -> (f32, f32, f32) {
+    let (default_min, default_max, default_threshold) = match profile {
+        CorrectionProfile::Journal => (0.95, 1.05, 0.95),
+        CorrectionProfile::Technical => (0.9, 1.1, 0.9),
+    };
+
+    let suffix = match profile {
+        CorrectionProfile::Journal => "JOURNAL",
+        CorrectionProfile::Technical => "TECHNICAL",
+    };
+
+    let min_ratio = parse_env_f32(&format!("EARS_CORRECTION_MIN_RATIO_{}", suffix), default_min);
+    let max_ratio = parse_env_f32(&format!("EARS_CORRECTION_MAX_RATIO_{}", suffix), default_max);
+    let overlap = parse_env_f32(&format!("EARS_CORRECTION_MIN_OVERLAP_{}", suffix), default_threshold);
+
+    (min_ratio, max_ratio, overlap)
+}
+
+#[cfg(feature = "llm-correct")]
+fn preview_text(text: &str, max_len: usize) -> String {
+    let mut preview = text.replace('\n', "\\n");
+    if preview.len() > max_len {
+        preview.truncate(max_len);
+        preview.push_str("...");
+    }
+    preview
+}
+
+#[cfg(feature = "llm-correct")]
+fn normalize_accuracy_text(original: &str, text: &str) -> String {
+    if original.contains('\n') {
+        return text.trim().to_string();
+    }
+
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(feature = "llm-correct")]
+fn normalized_words(text: &str) -> Vec<String> {
+    let filler_words = ["uh", "um", "erm", "uhh", "umm"];
+    text.split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty() && !filler_words.contains(&w.as_str()))
+        .collect()
+}
+
+#[cfg(feature = "llm-correct")]
+fn correction_metrics(original: &str, corrected: &str) -> Option<(f32, f32, usize)> {
+    let original_words = normalized_words(original);
+    let corrected_words = normalized_words(corrected);
+    if original_words.is_empty() || corrected_words.is_empty() {
+        return None;
+    }
+
+    let original_len = original_words.len();
+    let corrected_len = corrected_words.len();
+    let len_ratio = corrected_len as f32 / original_len as f32;
+
+    let original_set: HashSet<String> = original_words.into_iter().collect();
+    let corrected_set: HashSet<String> = corrected_words.into_iter().collect();
+    let overlap = original_set.intersection(&corrected_set).count();
+    let overlap_ratio = overlap as f32 / original_set.len() as f32;
+
+    Some((len_ratio, overlap_ratio, original_len))
+}
+
+#[cfg(feature = "llm-correct")]
+#[derive(Clone, Debug)]
+struct Token {
+    original: String,
+    normalized: String,
+}
+
+#[cfg(feature = "llm-correct")]
+fn normalize_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
+
+#[cfg(feature = "llm-correct")]
+fn tokenize(text: &str) -> Vec<Token> {
+    text.split_whitespace()
+        .map(|word| Token {
+            original: word.to_string(),
+            normalized: normalize_token(word),
+        })
+        .collect()
+}
+
+#[cfg(feature = "llm-correct")]
+fn tokens_match(a: &[Token], b: &[Token]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .all(|(left, right)| !left.normalized.is_empty() && left.normalized == right.normalized)
+}
+
+#[cfg(feature = "llm-correct")]
+fn dedupe_adjacent_phrases(tokens: Vec<Token>, min_len: usize, max_len: usize) -> Vec<Token> {
+    if tokens.len() < min_len * 2 {
+        return tokens;
+    }
+
+    let mut output: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while index < tokens.len() {
+        let mut matched = false;
+        let upper = max_len.min((tokens.len() - index) / 2);
+        for length in (min_len..=upper).rev() {
+            let first = &tokens[index..index + length];
+            let second = &tokens[index + length..index + length * 2];
+            if tokens_match(first, second) {
+                output.extend_from_slice(first);
+                index += length * 2;
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+        output.push(tokens[index].clone());
+        index += 1;
+    }
+
+    output
+}
+
+#[cfg(feature = "llm-correct")]
+fn dedupe_adjacent_words(tokens: Vec<Token>) -> Vec<Token> {
+    let mut output: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut last_norm: Option<String> = None;
+    for token in tokens {
+        if !token.normalized.is_empty() {
+            if let Some(ref last) = last_norm {
+                if last == &token.normalized {
+                    continue;
+                }
+            }
+            last_norm = Some(token.normalized.clone());
+        } else {
+            last_norm = None;
+        }
+        output.push(token);
+    }
+    output
+}
+
+#[cfg(feature = "llm-correct")]
+fn dedupe_repeats(text: &str) -> String {
+    let tokens = tokenize(text);
+    if tokens.len() < 2 {
+        return text.to_string();
+    }
+    let tokens = dedupe_adjacent_phrases(tokens, 3, 6);
+    let tokens = dedupe_adjacent_words(tokens);
+    tokens
+        .into_iter()
+        .map(|token| token.original)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(feature = "llm-correct")]
+fn postprocess_candidate(profile: CorrectionProfile, text: &str) -> String {
+    if matches!(profile, CorrectionProfile::Technical) {
+        return dedupe_repeats(text);
+    }
+    text.to_string()
+}
 
 #[derive(Clone, Debug, clap::ValueEnum)]
 enum EngineArg {
@@ -67,6 +282,14 @@ impl From<CorrectionProfileArg> for CorrectionProfile {
             CorrectionProfileArg::Journal => CorrectionProfile::Journal,
             CorrectionProfileArg::Technical => CorrectionProfile::Technical,
         }
+    }
+}
+
+#[cfg(feature = "preview-overlay")]
+fn overlay_profile_label(profile: CorrectionProfileArg) -> &'static str {
+    match profile {
+        CorrectionProfileArg::Journal => "journal",
+        CorrectionProfileArg::Technical => "technical",
     }
 }
 
@@ -241,6 +464,14 @@ struct Args {
 
     #[arg(
         long,
+        env = "EARS_ACCURACY_ENABLED",
+        default_value_t = true,
+        help = "Enable accuracy pass (can be toggled via hotkey in preview mode)"
+    )]
+    accuracy_enabled: bool,
+
+    #[arg(
+        long,
         env = "EARS_ACCURACY_TIMEOUT_MS",
         default_value_t = 6000,
         help = "Timeout for accuracy pass in milliseconds"
@@ -345,6 +576,8 @@ async fn main() -> Result<()> {
     let (commit_tx, commit_rx) = bounded::<()>(1);
     let (respawn_overlay_tx, respawn_overlay_rx) = bounded::<()>(1);
     let (discard_tx, discard_rx) = bounded::<()>(1);
+    let (accuracy_toggle_tx, accuracy_toggle_rx) = unbounded::<()>();
+    let accuracy_enabled = Arc::new(AtomicBool::new(args.accuracy_enabled));
 
     // Preview mode flag (set by --preview arg)
     #[cfg(feature = "preview-overlay")]
@@ -460,11 +693,26 @@ async fn main() -> Result<()> {
     // Note: Commit is triggered by pressing Enter in the focused overlay window
     // SIGHUP is not used because it terminates the process before handler registers
 
-            let hotkey_running = running.clone();
-            let hotkey_capturing = capturing.clone();
-            let hotkey_grace = capture_grace_until.clone();
-            let hotkey_grace_ms = args.capture_grace_ms;
-            let hotkey_buffer = accuracy_buffer.clone();
+    // SIGRTMIN+1 toggles accuracy (preview overlay)
+    #[cfg(feature = "preview-overlay")]
+    {
+        let sig_accuracy_tx = accuracy_toggle_tx.clone();
+        tokio::spawn(async move {
+            let mut sig_accuracy = signal(SignalKind::from_raw(libc::SIGRTMIN() + 1))
+                .expect("failed to register SIGRTMIN+1 handler");
+            loop {
+                sig_accuracy.recv().await;
+                eprintln!("SIGRTMIN+1: accuracy toggle requested");
+                let _ = sig_accuracy_tx.send(());
+            }
+        });
+    }
+
+    let hotkey_running = running.clone();
+    let hotkey_capturing = capturing.clone();
+    let hotkey_grace = capture_grace_until.clone();
+    let hotkey_grace_ms = args.capture_grace_ms;
+    let hotkey_buffer = accuracy_buffer.clone();
     let hotkey_config = config.hotkeys.clone();
     let notification_config = config.dictation.notifications.clone();
     #[cfg(feature = "hooks")]
@@ -480,6 +728,7 @@ async fn main() -> Result<()> {
         let hotkey_final_tx = final_correct_tx.clone();
         let hotkey_checkpoint_tx = checkpoint_tx.clone();
         let hotkey_commit_tx = commit_tx.clone();
+        let hotkey_accuracy_tx = accuracy_toggle_tx.clone();
         #[cfg(feature = "preview-overlay")]
         let preview_config_hotkeys = config.dictation.preview.clone();
         let _hotkey_preview_mode = preview_mode;
@@ -600,6 +849,14 @@ async fn main() -> Result<()> {
                             );
                         }
 
+                        // Preview mode: accuracy toggle (numpad *)
+                        #[cfg(feature = "preview-overlay")]
+                        if hotkey_preview_mode && !CTRL && !SHIFT && !ALT && k == rdev::Key::KpMultiply {
+                            eprintln!("Accuracy toggle hotkey pressed");
+                            let _ = hotkey_accuracy_tx.send(());
+                            return;
+                        }
+
                         // Preview mode: checkpoint hotkey
                         #[cfg(feature = "preview-overlay")]
                         {
@@ -629,6 +886,7 @@ async fn main() -> Result<()> {
                         {
                             let _ = &hotkey_checkpoint_tx;
                             let _ = &hotkey_commit_tx;
+                            let _ = &hotkey_accuracy_tx;
                         }
                     },
                     _ => {}
@@ -684,6 +942,7 @@ async fn main() -> Result<()> {
                     backspace_delay: Duration::from_millis(args.backspace_delay_ms),
                     delete_word_delay: Duration::from_millis(args.delete_word_delay_ms),
                     chord_delay: Duration::from_millis(args.chord_delay_ms),
+                    newline_mode: parse_newline_mode(),
                 };
                 let mut keyboard = create_virtual_keyboard_with_timing(timing)
                     .context("Failed to initialize virtual keyboard. \
@@ -694,10 +953,14 @@ async fn main() -> Result<()> {
                 let mut overlay_handle: Option<OverlayHandle> = None;
                 #[cfg(not(feature = "preview-overlay"))]
                 let overlay_handle: Option<()> = None;
+                #[cfg(feature = "preview-overlay")]
+                let mut overlay_spawn_backoff: Option<Instant> = None;
 
                 #[cfg(feature = "llm-correct")]
                 let mut corrector = {
-                    let ollama_url = args.ollama_url.clone()
+                    let ollama_url = args
+                        .ollama_url
+                        .clone()
                         .unwrap_or_else(|| "http://localhost:11434".to_string());
                     let fast_model = args
                         .ollama_model_fast
@@ -709,8 +972,8 @@ async fn main() -> Result<()> {
                         .unwrap_or_else(|| args.ollama_model.clone());
                     let config = LlmCorrectConfig {
                         endpoint: ollama_url.clone(),
-                        model: fast_model,
-                        final_model,
+                        model: fast_model.clone(),
+                        final_model: final_model.clone(),
                         timeout_secs: 10,
                         num_predict_fast: args.ollama_num_predict_fast,
                         num_predict_final: args.ollama_num_predict_final,
@@ -725,6 +988,25 @@ async fn main() -> Result<()> {
                     );
                     SentenceCorrector::new(config)?
                 };
+
+                #[cfg(feature = "preview-overlay")]
+                let overlay_profile_label = overlay_profile_label(args.correction_profile);
+                #[cfg(feature = "preview-overlay")]
+                let overlay_model_label = {
+                    let fast_model = args
+                        .ollama_model_fast
+                        .clone()
+                        .unwrap_or_else(|| args.ollama_model.clone());
+                    let final_model = args
+                        .ollama_model_final
+                        .clone()
+                        .unwrap_or_else(|| args.ollama_model.clone());
+                    if fast_model == final_model {
+                        fast_model
+                    } else {
+                        format!("{} | {}", fast_model, final_model)
+                    }
+                };
                 #[cfg(feature = "llm-correct")]
                 let mut correction_buffer = CorrectionBuffer::new(args.correction_profile.into());
                 #[cfg(feature = "llm-correct")]
@@ -733,7 +1015,7 @@ async fn main() -> Result<()> {
                 #[cfg(all(feature = "llm-correct", feature = "preview-overlay"))]
                 let mut overlay_word_count: usize = 0;
 
-                let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<WriterCommand>();
+    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<WriterCommand>();
 
                 if let Some(ref lang) = args.lang {
                     eprintln!("Setting language to: {}", lang);
@@ -858,6 +1140,37 @@ async fn main() -> Result<()> {
                         overlay_handle = None;
                     }
 
+                    #[cfg(feature = "preview-overlay")]
+                    if preview_mode {
+                        let is_capturing = *capturing.lock().unwrap();
+                        if is_capturing && overlay_handle.is_none() {
+                            let now = Instant::now();
+                            if overlay_spawn_backoff.map_or(true, |next| now >= next) {
+                                eprintln!("[PREVIEW] Spawning overlay...");
+                                match spawn_overlay(preview_window_width, preview_window_height) {
+                                    Ok(handle) => {
+                                        eprintln!("Preview overlay spawned");
+                                        let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
+                                        let info = format!(
+                                            "profile: {} | accuracy: {} | model: {}",
+                                            overlay_profile_label,
+                                            if accuracy_on { "on" } else { "off" },
+                                            overlay_model_label,
+                                        );
+                                        let _ = handle.set_info(info);
+                                        overlay_handle = Some(handle);
+                                        overlay_closed_logged = false;
+                                        overlay_spawn_backoff = None;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to spawn preview overlay: {}", e);
+                                        overlay_spawn_backoff = Some(now + std::time::Duration::from_secs(2));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     select! {
                         recv(stop_rx) -> _ => {
                             #[cfg(feature = "preview-overlay")]
@@ -933,16 +1246,36 @@ async fn main() -> Result<()> {
                         // Respawn overlay when toggle turns on and overlay is closed
                         recv(respawn_overlay_rx) -> _ => {
                             #[cfg(feature = "preview-overlay")]
-                            if preview_mode && overlay_handle.is_none() {
-                                eprintln!("[PREVIEW] Respawning overlay...");
-                                match spawn_overlay(preview_window_width, preview_window_height) {
-                                    Ok(handle) => {
-                                        eprintln!("Preview overlay respawned");
-                                        overlay_handle = Some(handle);
-                                        overlay_closed_logged = false;
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to respawn preview overlay: {}", e);
+                            if preview_mode {
+                                if let Some(ref handle) = overlay_handle {
+                                    let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
+                                    let info = format!(
+                                        "profile: {} | accuracy: {} | model: {}",
+                                        overlay_profile_label,
+                                        if accuracy_on { "on" } else { "off" },
+                                        overlay_model_label,
+                                    );
+                                    let _ = handle.set_info(info);
+                                    let _ = handle.show();
+                                } else {
+                                    eprintln!("[PREVIEW] Respawning overlay...");
+                                    match spawn_overlay(preview_window_width, preview_window_height) {
+                                        Ok(handle) => {
+                                            eprintln!("Preview overlay respawned");
+                                            let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
+                                            let info = format!(
+                                                "profile: {} | accuracy: {} | model: {}",
+                                                overlay_profile_label,
+                                                if accuracy_on { "on" } else { "off" },
+                                                overlay_model_label,
+                                            );
+                                            let _ = handle.set_info(info);
+                                            overlay_handle = Some(handle);
+                                            overlay_closed_logged = false;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to respawn preview overlay: {}", e);
+                                        }
                                     }
                                 }
                             }
@@ -962,6 +1295,23 @@ async fn main() -> Result<()> {
                                 }
                                 *capturing.lock().unwrap() = false;
                                 write_status("paused");
+                            }
+                        }
+                        recv(accuracy_toggle_rx) -> _ => {
+                            let current = accuracy_enabled.load(Ordering::Relaxed);
+                            let new_value = !current;
+                            accuracy_enabled.store(new_value, Ordering::Relaxed);
+                            let accuracy_on = should_run_accuracy(&args, new_value);
+                            eprintln!("[ACCURACY TOGGLE] {}", if accuracy_on { "enabled" } else { "disabled" });
+                            #[cfg(feature = "preview-overlay")]
+                            if let Some(ref handle) = overlay_handle {
+                                let info = format!(
+                                    "profile: {} | accuracy: {} | model: {}",
+                                    overlay_profile_label,
+                                    if accuracy_on { "on" } else { "off" },
+                                    overlay_model_label,
+                                );
+                                let _ = handle.set_info(info);
                             }
                         }
                         // Trigger final correction when capture is toggled off
@@ -1013,46 +1363,101 @@ async fn main() -> Result<()> {
                                             let _ = handle.set_status(OverlayStatus::Correcting);
                                         }
                                         write_status("processing");
+                                        let profile: CorrectionProfile = args.correction_profile.into();
                                         let (paragraph, _word_count, _char_count) = correction_buffer.take_paragraph();
+                                        let mut llm_candidate: Option<String> = None;
                                         match corrector.correct_paragraph(&paragraph).await {
                                             Ok(corrected) if corrected != paragraph => {
-                                                if !is_safe_correction(&paragraph, &corrected, args.correction_profile.into()) {
+                                                let processed = postprocess_candidate(profile, &corrected);
+                                                if !is_safe_correction(&paragraph, &processed, profile) {
                                                     eprintln!("[TOGGLE-OFF FINAL SKIP] low similarity");
                                                 } else {
-                                                    eprintln!("[TOGGLE-OFF FINAL] '{}' -> '{}'", paragraph, corrected);
-                                                    if let Some(ref handle) = overlay_handle {
-                                                        let _ = handle.send_correction(corrected);
-                                                    }
+                                                    eprintln!("[TOGGLE-OFF FINAL CANDIDATE] '{}' -> '{}'", paragraph, processed);
+                                                    llm_candidate = Some(processed);
                                                 }
                                             }
                                             Ok(_) => {}
                                             Err(e) => eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e),
+                                        }
+
+                                        let mut final_text: Option<String> = None;
+                                        if matches!(profile, CorrectionProfile::Technical) {
+                                            let mut accuracy_candidate: Option<String> = None;
+                                            if should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed)) {
+                                                if let Ok(Some(accuracy_text)) = run_accuracy_pass(&accuracy_buffer, &args).await {
+                                                    let normalized = normalize_accuracy_text(&paragraph, &accuracy_text);
+                                                    let processed = postprocess_candidate(profile, &normalized);
+                                                    if processed != paragraph
+                                                        && is_safe_correction(&paragraph, &processed, profile)
+                                                    {
+                                                        eprintln!("[TOGGLE-OFF ACCURACY CANDIDATE] '{}' -> '{}'", paragraph, processed);
+                                                        accuracy_candidate = Some(processed);
+                                                    } else {
+                                                        eprintln!("[TOGGLE-OFF ACCURACY] No changes needed");
+                                                    }
+                                                }
+                                            }
+
+                                            if let Some((chosen_text, source)) =
+                                                choose_best_correction(&paragraph, llm_candidate, accuracy_candidate)
+                                            {
+                                                if chosen_text != paragraph {
+                                                    eprintln!("[TOGGLE-OFF APPLY] source={:?} '{}' -> '{}'", source, paragraph, chosen_text);
+                                                    final_text = Some(chosen_text);
+                                                }
+                                            }
+                                        } else {
+                                            if let Some(corrected) = llm_candidate {
+                                                final_text = Some(corrected);
+                                            }
+
+                                            if should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed)) {
+                                                if let Ok(Some(accuracy_text)) = run_accuracy_pass(&accuracy_buffer, &args).await {
+                                                    let normalized = normalize_accuracy_text(&paragraph, &accuracy_text);
+                                                    let processed = postprocess_candidate(profile, &normalized);
+                                                    let base = final_text.as_deref().unwrap_or(&paragraph);
+                                                    if processed != base
+                                                        && is_safe_correction(base, &processed, profile)
+                                                    {
+                                                        eprintln!("[TOGGLE-OFF ACCURACY] '{}' -> '{}'", base, processed);
+                                                        final_text = Some(processed);
+                                                    } else {
+                                                        eprintln!("[TOGGLE-OFF ACCURACY] No changes needed");
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if let Some(text) = final_text {
+                                            if let Some(ref handle) = overlay_handle {
+                                                let _ = handle.send_correction(text);
+                                            }
                                         }
                                     }
                                     // Commit overlay (paste buffer, close window)
                                     if let Some(ref handle) = overlay_handle {
                                         eprintln!("[TOGGLE-OFF] Committing overlay");
                                         let _ = handle.commit();
-                                        // Wait for overlay to fully close so respawn works
+                                        let paste_deadline = Instant::now()
+                                            + std::time::Duration::from_millis(1500);
+                                        let mut pasted = false;
                                         loop {
                                             if let Some(response) = handle.try_recv() {
-                                                match response {
-                                                    OverlayResponse::PasteText(text) => {
-                                                        eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
-                                                        if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
-                                                            eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
-                                                        }
+                                                if let OverlayResponse::PasteText(text) = response {
+                                                    eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
+                                                    if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
+                                                        eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
                                                     }
-                                                    OverlayResponse::Closed => {
-                                                        eprintln!("[TOGGLE-OFF] Overlay closed");
-                                                        break;
-                                                    }
+                                                    pasted = true;
                                                 }
+                                            }
+                                            if pasted || Instant::now() >= paste_deadline {
+                                                break;
                                             }
                                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                                         }
+                                        let _ = handle.hide();
                                     }
-                                    overlay_handle = None;
                                     overlay_closed_logged = false;
                                     overlay_word_count = 0;
                                     write_status("paused");
@@ -1098,6 +1503,7 @@ async fn main() -> Result<()> {
                                             &mut corrector,
                                             &accuracy_buffer,
                                             &args,
+                                            &accuracy_enabled,
                                         ).await {
                                             eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
                                         }
@@ -1142,6 +1548,7 @@ async fn main() -> Result<()> {
                                             &mut corrector,
                                             &accuracy_buffer,
                                             &args,
+                                            &accuracy_enabled,
                                         ).await {
                                             eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e);
                                         }
@@ -1405,6 +1812,7 @@ async fn main() -> Result<()> {
                                             &mut corrector,
                                             &accuracy_buffer,
                                             &args,
+                                            &accuracy_enabled,
                                         ).await {
                                             eprintln!("[FINAL ERROR] {}", e);
                                         }
@@ -1491,6 +1899,7 @@ async fn main() -> Result<()> {
                                             &mut corrector,
                                             &accuracy_buffer,
                                             &args,
+                                            &accuracy_enabled,
                                         ).await {
                                             eprintln!("[FINAL ERROR] {}", e);
                                         }
@@ -1589,10 +1998,13 @@ struct CorrectionBuffer {
 #[cfg(feature = "llm-correct")]
 impl CorrectionBuffer {
     fn new(profile: CorrectionProfile) -> Self {
-        let (chunk_size, correct_on_commas, enable_chunk_correction) = match profile {
+        let (chunk_size, correct_on_commas, mut enable_chunk_correction) = match profile {
             CorrectionProfile::Journal => (6, true, false),
             CorrectionProfile::Technical => (10, false, true),
         };
+        if should_disable_chunk_correction(profile) {
+            enable_chunk_correction = false;
+        }
         Self {
             chunk_words: Vec::new(),
             chunk_char_count: 0,
@@ -1706,47 +2118,93 @@ impl CorrectionBuffer {
 
 #[cfg(feature = "llm-correct")]
 fn is_safe_correction(original: &str, corrected: &str, profile: CorrectionProfile) -> bool {
-    let filler_words = ["uh", "um", "erm", "uhh", "umm"];
-    let normalize = |word: &str| {
-        word.trim_matches(|c: char| !c.is_alphanumeric())
-            .to_lowercase()
+    let Some((len_ratio, overlap_ratio, original_len)) = correction_metrics(original, corrected) else {
+        if should_log_rejected_corrections() {
+            eprintln!(
+                "[CORRECTION REJECTED] profile={:?} reason=empty original_len={} corrected_len={} original='{}' corrected='{}'",
+                profile,
+                original.len(),
+                corrected.len(),
+                preview_text(original, 160),
+                preview_text(corrected, 160)
+            );
+        }
+        return false;
     };
 
-    let original_words: Vec<String> = original
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty() && !filler_words.contains(&w.as_str()))
-        .collect();
-    let corrected_words: Vec<String> = corrected
-        .split_whitespace()
-        .map(normalize)
-        .filter(|w| !w.is_empty() && !filler_words.contains(&w.as_str()))
-        .collect();
+    let (min_ratio, max_ratio, base_threshold) = correction_thresholds(profile);
 
-    if original_words.is_empty() || corrected_words.is_empty() {
-        return false;
+    let threshold = if original_len <= 3 { 0.7 } else { base_threshold };
+    let len_ok = len_ratio <= max_ratio && len_ratio >= min_ratio;
+    let overlap_ok = overlap_ratio >= threshold;
+    let safe = len_ok && overlap_ok;
+
+    if !safe && should_log_rejected_corrections() {
+        eprintln!(
+            "[CORRECTION REJECTED] profile={:?} len_ratio={:.2} (min={:.2} max={:.2}) overlap_ratio={:.2} (min={:.2}) original='{}' corrected='{}'",
+            profile,
+            len_ratio,
+            min_ratio,
+            max_ratio,
+            overlap_ratio,
+            threshold,
+            preview_text(original, 160),
+            preview_text(corrected, 160)
+        );
     }
 
-    let original_len = original_words.len();
-    let corrected_len = corrected_words.len();
+    safe
+}
 
-    let (min_ratio, max_ratio, base_threshold) = match profile {
-        CorrectionProfile::Journal => (0.95, 1.05, 0.95),
-        CorrectionProfile::Technical => (0.9, 1.1, 0.9),
+#[cfg(feature = "llm-correct")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorrectionSource {
+    Llm,
+    Accuracy,
+}
+
+#[cfg(feature = "llm-correct")]
+fn choose_best_correction(
+    original: &str,
+    llm_text: Option<String>,
+    accuracy_text: Option<String>,
+) -> Option<(String, CorrectionSource)> {
+    let Some(llm_text) = llm_text else {
+        return accuracy_text.map(|text| (text, CorrectionSource::Accuracy));
     };
 
-    let len_ratio = corrected_len as f32 / original_len as f32;
-    if len_ratio > max_ratio || len_ratio < min_ratio {
-        return false;
+    let Some(accuracy_text) = accuracy_text else {
+        return Some((llm_text, CorrectionSource::Llm));
+    };
+
+    if llm_text == accuracy_text {
+        return Some((llm_text, CorrectionSource::Llm));
     }
 
-    let original_set: HashSet<String> = original_words.into_iter().collect();
-    let corrected_set: HashSet<String> = corrected_words.into_iter().collect();
-    let overlap = original_set.intersection(&corrected_set).count();
-    let overlap_ratio = overlap as f32 / original_set.len() as f32;
+    let llm_metrics = correction_metrics(original, &llm_text);
+    let acc_metrics = correction_metrics(original, &accuracy_text);
 
-    let threshold = if original_set.len() <= 3 { 0.7 } else { base_threshold };
-    overlap_ratio >= threshold
+    let Some((llm_len_ratio, llm_overlap, _)) = llm_metrics else {
+        return Some((accuracy_text, CorrectionSource::Accuracy));
+    };
+    let Some((acc_len_ratio, acc_overlap, _)) = acc_metrics else {
+        return Some((llm_text, CorrectionSource::Llm));
+    };
+
+    if acc_overlap > llm_overlap + 0.01 {
+        return Some((accuracy_text, CorrectionSource::Accuracy));
+    }
+    if llm_overlap > acc_overlap + 0.01 {
+        return Some((llm_text, CorrectionSource::Llm));
+    }
+
+    let acc_len_diff = (acc_len_ratio - 1.0).abs();
+    let llm_len_diff = (llm_len_ratio - 1.0).abs();
+    if acc_len_diff + 0.01 < llm_len_diff {
+        return Some((accuracy_text, CorrectionSource::Accuracy));
+    }
+
+    Some((llm_text, CorrectionSource::Llm))
 }
 
 #[cfg(not(feature = "llm-correct"))]
@@ -1847,6 +2305,7 @@ async fn correct_final_paragraph(
     corrector: &mut SentenceCorrector,
     accuracy_buffer: &Arc<Mutex<VecDeque<f32>>>,
     args: &Args,
+    accuracy_enabled: &AtomicBool,
 ) -> Result<()> {
     if buffer.paragraph_len() < 2 {
         return Ok(());
@@ -1855,6 +2314,72 @@ async fn correct_final_paragraph(
     let (original, word_count, char_count) = buffer.take_paragraph();
 
     eprintln!("[FINAL DEBUG] word_count={}, original_len={}", word_count, original.len());
+
+    if matches!(corrector.profile(), CorrectionProfile::Technical) {
+        let mut llm_candidate: Option<String> = None;
+        match corrector.correct_paragraph(&original).await {
+            Ok(corrected) if corrected != original => {
+                let processed = postprocess_candidate(corrector.profile(), &corrected);
+                if !is_safe_correction(&original, &processed, corrector.profile()) {
+                    eprintln!("[FINAL SKIP] low similarity");
+                } else {
+                    eprintln!("[FINAL CANDIDATE] '{}' -> '{}'", original, processed);
+                    llm_candidate = Some(processed);
+                }
+            }
+            Ok(_) => {
+                eprintln!("[FINAL] No changes needed");
+            }
+            Err(e) => {
+                eprintln!("[FINAL ERROR] {}", e);
+            }
+        }
+
+        let mut accuracy_candidate: Option<String> = None;
+    if should_run_accuracy(args, accuracy_enabled.load(Ordering::Relaxed)) {
+        if let Ok(Some(accuracy_text)) = run_accuracy_pass(accuracy_buffer, args).await {
+            let normalized = normalize_accuracy_text(&original, &accuracy_text);
+            let processed = postprocess_candidate(corrector.profile(), &normalized);
+            if processed != original
+                && is_safe_correction(&original, &processed, corrector.profile())
+            {
+                eprintln!("[ACCURACY CANDIDATE] '{}' -> '{}'", original, processed);
+                accuracy_candidate = Some(processed);
+            } else {
+                eprintln!("[ACCURACY] No changes needed");
+            }
+        }
+    }
+
+        let chosen = choose_best_correction(&original, llm_candidate, accuracy_candidate);
+        if let Some((chosen_text, source)) = chosen {
+            if chosen_text == original {
+                return Ok(());
+            }
+            eprintln!("[FINAL APPLY] source={:?} '{}' -> '{}'", source, original, chosen_text);
+
+            let use_word_delete = should_disable_chunk_correction(corrector.profile());
+            if use_word_delete {
+                if let Err(e) = keyboard.delete_words(word_count) {
+                    eprintln!("[FINAL DELETE WORDS ERROR] {}", e);
+                    let total_backspaces = char_count.saturating_add(1);
+                    for _ in 0..total_backspaces {
+                        keyboard.press_key(SpecialKey::Backspace)?;
+                    }
+                }
+            } else {
+                let total_backspaces = char_count.saturating_add(1);
+                for _ in 0..total_backspaces {
+                    keyboard.press_key(SpecialKey::Backspace)?;
+                }
+            }
+
+            keyboard.type_text(&chosen_text)?;
+            keyboard.press_key(SpecialKey::Space)?;
+        }
+
+        return Ok(());
+    }
 
     let mut final_text = original.clone();
     match corrector.correct_paragraph(&original).await {
@@ -1865,13 +2390,11 @@ async fn correct_final_paragraph(
             }
             eprintln!("[FINAL] '{}' -> '{}'", original, corrected);
 
-            // Delete trailing space plus typed characters to avoid word-boundary issues
             let total_backspaces = char_count.saturating_add(1);
             for _ in 0..total_backspaces {
                 keyboard.press_key(SpecialKey::Backspace)?;
             }
 
-            // Type corrected text
             keyboard.type_text(&corrected)?;
             keyboard.press_key(SpecialKey::Space)?;
             final_text = corrected;
@@ -1884,17 +2407,18 @@ async fn correct_final_paragraph(
         }
     }
 
-    if should_run_accuracy(args) {
+    if should_run_accuracy(args, accuracy_enabled.load(Ordering::Relaxed)) {
         if let Ok(Some(accuracy_text)) = run_accuracy_pass(accuracy_buffer, args).await {
-            if accuracy_text != final_text
-                && is_safe_correction(&final_text, &accuracy_text, corrector.profile())
+            let normalized = normalize_accuracy_text(&original, &accuracy_text);
+            if normalized != final_text
+                && is_safe_correction(&final_text, &normalized, corrector.profile())
             {
-                eprintln!("[ACCURACY] '{}' -> '{}'", final_text, accuracy_text);
+                eprintln!("[ACCURACY] '{}' -> '{}'", final_text, normalized);
                 let backspaces = final_text.len().saturating_add(1);
                 for _ in 0..backspaces {
                     keyboard.press_key(SpecialKey::Backspace)?;
                 }
-                keyboard.type_text(&accuracy_text)?;
+                keyboard.type_text(&normalized)?;
                 keyboard.press_key(SpecialKey::Space)?;
             } else {
                 eprintln!("[ACCURACY] No changes needed");
@@ -2002,7 +2526,10 @@ fn send_processing_notification(notifications: &DictationNotificationConfig) {
 }
 
 #[cfg(feature = "llm-correct")]
-fn should_run_accuracy(args: &Args) -> bool {
+fn should_run_accuracy(args: &Args, accuracy_enabled: bool) -> bool {
+    if !accuracy_enabled {
+        return false;
+    }
     if args.accuracy_url.trim().is_empty() {
         return false;
     }

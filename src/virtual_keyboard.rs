@@ -42,6 +42,7 @@ pub struct KeyboardTiming {
     pub backspace_delay: Duration,
     pub delete_word_delay: Duration,
     pub chord_delay: Duration,
+    pub newline_mode: NewlineMode,
 }
 
 impl Default for KeyboardTiming {
@@ -52,8 +53,15 @@ impl Default for KeyboardTiming {
             backspace_delay: Duration::from_millis(15),
             delete_word_delay: Duration::from_millis(10),
             chord_delay: Duration::from_millis(5),
+            newline_mode: NewlineMode::Enter,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewlineMode {
+    Enter,
+    ShiftEnter,
 }
 
 /// Special keys that can be pressed
@@ -180,6 +188,12 @@ impl UInputKeyboard {
 impl VirtualKeyboard for UInputKeyboard {
     fn type_text(&mut self, text: &str) -> Result<()> {
         for ch in text.chars() {
+            if ch == '\n' && matches!(self.timing.newline_mode, NewlineMode::ShiftEnter) {
+                self.press_modifier(Modifier::Shift)?;
+                self.press_key(SpecialKey::Enter)?;
+                self.release_modifier(Modifier::Shift)?;
+                continue;
+            }
             // Skip unsupported characters (non-ASCII) instead of crashing
             if let Err(_) = self.type_char(ch) {
                 continue;
@@ -358,6 +372,12 @@ impl EnigoKeyboard {
 impl VirtualKeyboard for EnigoKeyboard {
     fn type_text(&mut self, text: &str) -> Result<()> {
         for ch in text.chars() {
+            if ch == '\n' && matches!(self.timing.newline_mode, NewlineMode::ShiftEnter) {
+                self.press_modifier(Modifier::Shift)?;
+                self.press_key(SpecialKey::Enter)?;
+                self.release_modifier(Modifier::Shift)?;
+                continue;
+            }
             self.enigo
                 .key(enigo::Key::Unicode(ch), Direction::Click)
                 .context("Failed to type text with enigo")?;
