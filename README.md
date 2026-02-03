@@ -341,6 +341,7 @@ Typing delay controls (for apps that drop fast input):
 - `EARS_ACCURACY_TIMEOUT_MS` (default `6000`)
 - `EARS_ACCURACY_MAX_SECONDS` (default `120`)
 - `EARS_PREVIEW_AUTOCOMMIT_SECS` (default `10`, set `0` to disable auto-commit in preview)
+- `EARS_PASTE_MODE` (default `paste`, set `type` to type output instead of clipboard paste)
 
 Preview review history:
 

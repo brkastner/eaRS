@@ -87,6 +87,46 @@ fn parse_env_u64(key: &str, default_value: u64) -> u64 {
         .unwrap_or(default_value)
 }
 
+fn type_output_delay_ms() -> u64 {
+    parse_env_u64("EARS_TYPE_OUTPUT_DELAY_MS", 150)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PasteMode {
+    Paste,
+    Type,
+}
+
+fn parse_paste_mode() -> PasteMode {
+    match env::var("EARS_PASTE_MODE").ok().as_deref() {
+        Some("type") => PasteMode::Type,
+        _ => PasteMode::Paste,
+    }
+}
+
+fn emit_output_text_with_mode(
+    text: &str,
+    mode: PasteMode,
+    keyboard: &mut dyn VirtualKeyboard,
+    paste_hotkey: &str,
+) -> Result<()> {
+    match mode {
+        PasteMode::Type => {
+            keyboard.type_text(text)?;
+            Ok(())
+        }
+        PasteMode::Paste => copy_and_paste(text, keyboard, paste_hotkey),
+    }
+}
+
+fn emit_output_text(
+    text: &str,
+    keyboard: &mut dyn VirtualKeyboard,
+    paste_hotkey: &str,
+) -> Result<()> {
+    emit_output_text_with_mode(text, parse_paste_mode(), keyboard, paste_hotkey)
+}
+
 #[cfg(feature = "preview-overlay")]
 fn review_history_path() -> Option<PathBuf> {
     let state_dir = if let Ok(dir) = env::var("XDG_STATE_HOME") {
@@ -1085,6 +1125,9 @@ async fn main() -> Result<()> {
                         format!("{} | {}", fast_model, final_model)
                     }
                 };
+                #[cfg(feature = "preview-overlay")]
+                let overlay_accuracy_model_label = std::env::var("EARS_ACCURACY_MODEL_LABEL")
+                    .unwrap_or_else(|_| "unknown".to_string());
                 #[cfg(feature = "llm-correct")]
                 let mut correction_buffer = CorrectionBuffer::new(args.correction_profile.into());
                 #[cfg(feature = "llm-correct")]
@@ -1197,9 +1240,9 @@ async fn main() -> Result<()> {
                         while let Some(response) = handle.try_recv() {
                             match response {
                                 OverlayResponse::PasteText(text) => {
-                                    eprintln!("[PREVIEW] Pasting text: {} chars", text.len());
-                                    if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
-                                        eprintln!("[PREVIEW PASTE ERROR] {}", e);
+                                    eprintln!("[PREVIEW] Output text: {} chars", text.len());
+                                    if let Err(e) = emit_output_text(&text, keyboard.as_mut(), &paste_hotkey) {
+                                        eprintln!("[PREVIEW OUTPUT ERROR] {}", e);
                                     }
                                 }
                                 OverlayResponse::Closed => {
@@ -1226,9 +1269,10 @@ async fn main() -> Result<()> {
                                         eprintln!("Preview overlay spawned");
                                         let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
                                         let info = format!(
-                                            "profile: {} | accuracy: {} | model: {}",
+                                            "profile: {} | accuracy: {} ({}) | model: {}",
                                             overlay_profile_label,
                                             if accuracy_on { "on" } else { "off" },
+                                            overlay_accuracy_model_label,
                                             overlay_model_label,
                                         );
                                         let _ = handle.set_info(info);
@@ -1324,12 +1368,14 @@ async fn main() -> Result<()> {
                                 if let Some(ref handle) = overlay_handle {
                                     let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
                                     let info = format!(
-                                        "profile: {} | accuracy: {} | model: {}",
+                                        "profile: {} | accuracy: {} ({}) | model: {}",
                                         overlay_profile_label,
                                         if accuracy_on { "on" } else { "off" },
+                                        overlay_accuracy_model_label,
                                         overlay_model_label,
                                     );
                                     let _ = handle.set_info(info);
+                                    let _ = handle.set_status(OverlayStatus::Listening);
                                     let _ = handle.show();
                                 } else {
                                     eprintln!("[PREVIEW] Respawning overlay...");
@@ -1338,12 +1384,14 @@ async fn main() -> Result<()> {
                                             eprintln!("Preview overlay respawned");
                                             let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
                                             let info = format!(
-                                                "profile: {} | accuracy: {} | model: {}",
+                                                "profile: {} | accuracy: {} ({}) | model: {}",
                                                 overlay_profile_label,
                                                 if accuracy_on { "on" } else { "off" },
+                                                overlay_accuracy_model_label,
                                                 overlay_model_label,
                                             );
                                             let _ = handle.set_info(info);
+                                            let _ = handle.set_status(OverlayStatus::Listening);
                                             overlay_handle = Some(handle);
                                             overlay_closed_logged = false;
                                         }
@@ -1380,9 +1428,10 @@ async fn main() -> Result<()> {
                             #[cfg(feature = "preview-overlay")]
                             if let Some(ref handle) = overlay_handle {
                                 let info = format!(
-                                    "profile: {} | accuracy: {} | model: {}",
+                                    "profile: {} | accuracy: {} ({}) | model: {}",
                                     overlay_profile_label,
                                     if accuracy_on { "on" } else { "off" },
+                                    overlay_accuracy_model_label,
                                     overlay_model_label,
                                 );
                                 let _ = handle.set_info(info);
@@ -1574,7 +1623,7 @@ async fn main() -> Result<()> {
                                                 loop {
                                                     if let Some(response) = handle.try_recv() {
                                                         match response {
-                                                            OverlayResponse::ReviewSelection { choice, text } => {
+                                                            OverlayResponse::ReviewSelection { choice, text, type_output } => {
                                                                 log_review_decision(
                                                                     profile,
                                                                     accuracy_on,
@@ -1587,9 +1636,16 @@ async fn main() -> Result<()> {
                                                                     choice,
                                                                     &text,
                                                                 );
-                                                                eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
-                                                                if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
-                                                                    eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
+                                                                let mode = if type_output { PasteMode::Type } else { parse_paste_mode() };
+                                                                if type_output {
+                                                                    let delay_ms = type_output_delay_ms();
+                                                                    if delay_ms > 0 {
+                                                                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                                                    }
+                                                                }
+                                                                eprintln!("[TOGGLE-OFF] Output text: {} chars", text.len());
+                                                                if let Err(e) = emit_output_text_with_mode(&text, mode, keyboard.as_mut(), &paste_hotkey) {
+                                                                    eprintln!("[TOGGLE-OFF OUTPUT ERROR] {}", e);
                                                                 }
                                                                 pasted = true;
                                                                 break;
@@ -1640,9 +1696,9 @@ async fn main() -> Result<()> {
                                             loop {
                                                 if let Some(response) = handle.try_recv() {
                                                     if let OverlayResponse::PasteText(text) = response {
-                                                        eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
-                                                        if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
-                                                            eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
+                                                        eprintln!("[TOGGLE-OFF] Output text: {} chars", text.len());
+                                                        if let Err(e) = emit_output_text(&text, keyboard.as_mut(), &paste_hotkey) {
+                                                            eprintln!("[TOGGLE-OFF OUTPUT ERROR] {}", e);
                                                         }
                                                         pasted = true;
                                                     }

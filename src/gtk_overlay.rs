@@ -106,7 +106,7 @@ pub enum OverlayResponse {
     /// Review was canceled
     Cancel,
     /// Review selection
-    ReviewSelection { choice: ReviewChoice, text: String },
+    ReviewSelection { choice: ReviewChoice, text: String, type_output: bool },
 }
 
 /// Handle to communicate with the overlay from the main thread
@@ -316,6 +316,8 @@ struct OverlayState {
     review_active: bool,
     review_options: Vec<ReviewOption>,
     review_selected: usize,
+    pending_selection: Option<ReviewOption>,
+    pending_type_output: bool,
     response_tx: Sender<OverlayResponse>,
     scrolled: ScrolledWindow,
     content_box: GtkBox,
@@ -333,8 +335,13 @@ impl OverlayState {
 
         if self.review_active {
             self.update_review_display();
-            self.word_count_label
-                .set_label("↑/↓ select · → paste · Esc cancel");
+            if self.pending_selection.is_some() && self.pending_type_output {
+                self.word_count_label
+                    .set_label("release shift to type");
+            } else {
+                self.word_count_label
+                    .set_label("↑/↓ select · → paste · Esc cancel");
+            }
             return;
         }
 
@@ -489,8 +496,8 @@ fn build_window(
     let default_width = base_width.min(max_default_width);
     let default_height = base_height.min(max_default_height);
 
-    let review_width = ((monitor_width as f32) * 0.50) as i32;
-    let review_height = ((monitor_height as f32) * 0.50) as i32;
+    let review_width = ((monitor_width as f32) * 0.30) as i32;
+    let review_height = ((monitor_height as f32) * 0.30) as i32;
 
     let center_window = move |window: &ApplicationWindow, width: i32, height: i32| {
         let offset_x = ((monitor_width - width) / 2).max(0);
@@ -566,6 +573,8 @@ fn build_window(
         review_active: false,
         review_options: Vec::new(),
         review_selected: 0,
+        pending_selection: None,
+        pending_type_output: false,
         response_tx,
         scrolled: scrolled.clone(),
         content_box,
@@ -582,13 +591,18 @@ fn build_window(
     let state_key = state.clone();
     let window_key = window.clone();
     let key_controller = gtk4::EventControllerKey::new();
-    key_controller.connect_key_pressed(move |_, key, _, _| {
+    let response_tx_key = response_tx_clone.clone();
+    key_controller.connect_key_pressed(move |_, key, _, modifiers| {
         let mut state = state_key.borrow_mut();
         if !state.review_active {
             return glib::Propagation::Proceed;
         }
+        if state.pending_selection.is_some() && state.pending_type_output {
+            return glib::Propagation::Stop;
+        }
 
         let option_count = state.review_options.len();
+        let type_output = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
         match key {
             gdk::Key::Up => {
                 if option_count > 0 {
@@ -606,8 +620,17 @@ fn build_window(
             }
             gdk::Key::Right | gdk::Key::Return | gdk::Key::KP_Enter => {
                 let selected = state.review_options.get(state.review_selected).cloned();
+                if type_output {
+                    state.pending_selection = selected;
+                    state.pending_type_output = true;
+                    state.update_display();
+                    return glib::Propagation::Stop;
+                }
+
                 state.review_active = false;
                 state.review_options.clear();
+                state.pending_selection = None;
+                state.pending_type_output = false;
                 state.status = OverlayStatus::Paused;
                 state.update_status_display();
                 state.update_display();
@@ -620,12 +643,13 @@ fn build_window(
                 if let Some(option) = selected {
                     match option.choice {
                         ReviewChoice::Cancel => {
-                            let _ = response_tx_clone.send(OverlayResponse::Cancel);
+                            let _ = response_tx_key.send(OverlayResponse::Cancel);
                         }
                         _ => {
-                            let _ = response_tx_clone.send(OverlayResponse::ReviewSelection {
+                            let _ = response_tx_key.send(OverlayResponse::ReviewSelection {
                                 choice: option.choice,
                                 text: option.text,
+                                type_output,
                             });
                         }
                     }
@@ -635,6 +659,8 @@ fn build_window(
             gdk::Key::Escape => {
                 state.review_active = false;
                 state.review_options.clear();
+                state.pending_selection = None;
+                state.pending_type_output = false;
                 state.status = OverlayStatus::Paused;
                 state.update_status_display();
                 state.update_display();
@@ -644,11 +670,54 @@ fn build_window(
                 window_key.set_visible(false);
                 center_window(&window_key, default_width, default_height);
 
-                let _ = response_tx_clone.send(OverlayResponse::Cancel);
+                let _ = response_tx_key.send(OverlayResponse::Cancel);
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
         }
+    });
+    let state_release = state.clone();
+    let window_release = window.clone();
+    let response_tx_release = response_tx_clone.clone();
+    key_controller.connect_key_released(move |_, key, _, modifiers| {
+        let mut state = state_release.borrow_mut();
+        if !state.review_active || state.pending_selection.is_none() {
+            return glib::Propagation::Proceed;
+        }
+        if !matches!(key, gdk::Key::Shift_L | gdk::Key::Shift_R) {
+            return glib::Propagation::Stop;
+        }
+        if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+            return glib::Propagation::Stop;
+        }
+        let selected = state.pending_selection.take();
+        state.pending_type_output = false;
+        state.review_active = false;
+        state.review_options.clear();
+        state.status = OverlayStatus::Paused;
+        state.update_status_display();
+        state.update_display();
+        drop(state);
+
+        window_release.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+        window_release.set_visible(false);
+        center_window(&window_release, default_width, default_height);
+
+        if let Some(option) = selected {
+            match option.choice {
+                ReviewChoice::Cancel => {
+                    let _ = response_tx_release.send(OverlayResponse::Cancel);
+                }
+                _ => {
+                    let _ = response_tx_release.send(OverlayResponse::ReviewSelection {
+                        choice: option.choice,
+                        text: option.text,
+                        type_output: true,
+                    });
+                }
+            }
+        }
+        glib::Propagation::Stop
     });
     window.add_controller(key_controller);
 

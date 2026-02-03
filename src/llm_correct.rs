@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Configuration for LLM correction
 #[derive(Debug, Clone)]
@@ -210,6 +210,7 @@ Text: {}"#,
     }
 
     async fn call_ollama(&self, prompt: &str, model: &str, num_predict: i32) -> Result<String> {
+        let t0 = Instant::now();
         let request = OllamaRequest {
             model,
             prompt: &prompt,
@@ -248,7 +249,16 @@ Text: {}"#,
             .trim_matches('"')
             .to_string();
 
-        Ok(strip_leading_preamble(&corrected))
+        let cleaned = strip_leading_preamble(&corrected);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[llm] model={} predict={} ms={:.1} chars={}",
+            model,
+            num_predict,
+            elapsed_ms,
+            cleaned.len(),
+        );
+        Ok(cleaned)
     }
 }
 
