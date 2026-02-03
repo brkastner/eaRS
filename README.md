@@ -337,8 +337,14 @@ Typing delay controls (for apps that drop fast input):
 - `EARS_CAPTURE_GRACE_MS` (default `500`, keeps audio flowing briefly after toggle-off)
 - `EARS_ACCURACY_URL` (optional, e.g. `ws://127.0.0.1:8772/ws`)
 - `EARS_ACCURACY_PROFILE` (default `technical`)
+- `EARS_ACCURACY_ENABLED` (default `true`, can be toggled during preview)
 - `EARS_ACCURACY_TIMEOUT_MS` (default `6000`)
 - `EARS_ACCURACY_MAX_SECONDS` (default `120`)
+- `EARS_PREVIEW_AUTOCOMMIT_SECS` (default `10`, set `0` to disable auto-commit in preview)
+
+Preview review history:
+
+- `~/.local/state/ears/review-history.jsonl` records manual review selections when accuracy + preview are enabled.
 
 Helper script:
 

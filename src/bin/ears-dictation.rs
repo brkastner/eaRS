@@ -25,6 +25,9 @@ use serde_json::Value;
 use std::fs;
 #[cfg(feature = "hooks")]
 use std::process::Command as ProcessCommand;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 #[cfg(feature = "llm-correct")]
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -82,6 +85,73 @@ fn parse_env_u64(key: &str, default_value: u64) -> u64 {
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(default_value)
+}
+
+#[cfg(feature = "preview-overlay")]
+fn review_history_path() -> Option<PathBuf> {
+    let state_dir = if let Ok(dir) = env::var("XDG_STATE_HOME") {
+        PathBuf::from(dir)
+    } else if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".local/state")
+    } else {
+        return None;
+    };
+    Some(state_dir.join("ears").join("review-history.jsonl"))
+}
+
+#[cfg(feature = "preview-overlay")]
+fn log_review_decision(
+    profile: CorrectionProfile,
+    accuracy_enabled: bool,
+    model_label: &str,
+    raw_text: &str,
+    llm_text: Option<&str>,
+    llm_safe: bool,
+    accuracy_text: Option<&str>,
+    accuracy_safe: bool,
+    choice: ReviewChoice,
+    selected_text: &str,
+) {
+    let Some(path) = review_history_path() else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[REVIEW LOG] Failed to create dir: {}", e);
+            return;
+        }
+    }
+
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let record = serde_json::json!({
+        "ts_ms": timestamp_ms,
+        "profile": format!("{:?}", profile),
+        "accuracy_enabled": accuracy_enabled,
+        "model": model_label,
+        "raw": raw_text,
+        "llm": llm_text,
+        "llm_safe": llm_safe,
+        "accuracy": accuracy_text,
+        "accuracy_safe": accuracy_safe,
+        "choice": format!("{:?}", choice),
+        "selected": selected_text,
+    });
+
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            if let Err(e) = writeln!(file, "{}", record) {
+                eprintln!("[REVIEW LOG] Failed to write: {}", e);
+            }
+        }
+        Err(e) => {
+            eprintln!("[REVIEW LOG] Failed to open: {}", e);
+        }
+    }
 }
 
 #[cfg(feature = "llm-correct")]
@@ -1139,6 +1209,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 OverlayResponse::Cancel => {}
+                                OverlayResponse::ReviewSelection { .. } => {}
                             }
                         }
                     }
@@ -1371,14 +1442,20 @@ async fn main() -> Result<()> {
                                         let profile: CorrectionProfile = args.correction_profile.into();
                                         let (paragraph, _word_count, _char_count) = correction_buffer.take_paragraph();
                                         let mut llm_candidate: Option<String> = None;
+                                        let mut llm_candidate_review: Option<String> = None;
+                                        let mut llm_candidate_safe = false;
                                         match corrector.correct_paragraph(&paragraph).await {
                                             Ok(corrected) if corrected != paragraph => {
                                                 let processed = postprocess_candidate(profile, &corrected);
+                                                if processed != paragraph {
+                                                    llm_candidate_review = Some(processed.clone());
+                                                }
                                                 if !is_safe_correction(&paragraph, &processed, profile) {
                                                     eprintln!("[TOGGLE-OFF FINAL SKIP] low similarity");
                                                 } else {
                                                     eprintln!("[TOGGLE-OFF FINAL CANDIDATE] '{}' -> '{}'", paragraph, processed);
                                                     llm_candidate = Some(processed);
+                                                    llm_candidate_safe = true;
                                                 }
                                             }
                                             Ok(_) => {}
@@ -1386,17 +1463,23 @@ async fn main() -> Result<()> {
                                         }
 
                                         let mut accuracy_candidate: Option<String> = None;
+                                        let mut accuracy_candidate_review: Option<String> = None;
+                                        let mut accuracy_candidate_safe = false;
                                         let mut final_text: Option<String> = None;
                                         if matches!(profile, CorrectionProfile::Technical) {
                                             if accuracy_on {
                                                 if let Ok(Some(accuracy_text)) = run_accuracy_pass(&accuracy_buffer, &args).await {
                                                     let normalized = normalize_accuracy_text(&paragraph, &accuracy_text);
                                                     let processed = postprocess_candidate(profile, &normalized);
+                                                    if processed != paragraph {
+                                                        accuracy_candidate_review = Some(processed.clone());
+                                                    }
                                                     if processed != paragraph
                                                         && is_safe_correction(&paragraph, &processed, profile)
                                                     {
                                                         eprintln!("[TOGGLE-OFF ACCURACY CANDIDATE] '{}' -> '{}'", paragraph, processed);
                                                         accuracy_candidate = Some(processed);
+                                                        accuracy_candidate_safe = true;
                                                     } else {
                                                         eprintln!("[TOGGLE-OFF ACCURACY] No changes needed");
                                                     }
@@ -1421,11 +1504,15 @@ async fn main() -> Result<()> {
                                                     let normalized = normalize_accuracy_text(&paragraph, &accuracy_text);
                                                     let processed = postprocess_candidate(profile, &normalized);
                                                     let base = final_text.as_deref().unwrap_or(&paragraph);
+                                                    if processed != base {
+                                                        accuracy_candidate_review = Some(processed.clone());
+                                                    }
                                                     if processed != base
                                                         && is_safe_correction(base, &processed, profile)
                                                     {
                                                         eprintln!("[TOGGLE-OFF ACCURACY] '{}' -> '{}'", base, processed);
                                                         accuracy_candidate = Some(processed.clone());
+                                                        accuracy_candidate_safe = true;
                                                         final_text = Some(processed);
                                                     } else {
                                                         eprintln!("[TOGGLE-OFF ACCURACY] No changes needed");
@@ -1436,32 +1523,43 @@ async fn main() -> Result<()> {
 
                                         if accuracy_on {
                                             if let Some(ref handle) = overlay_handle {
-                                                let mut options = Vec::new();
+                                                let mut options: Vec<ReviewOption> = Vec::new();
                                                 options.push(ReviewOption {
                                                     choice: ReviewChoice::Raw,
                                                     text: paragraph.clone(),
+                                                    safe: true,
                                                 });
-                                                if let Some(ref text) = llm_candidate {
+
+                                                let mut final_index: Option<usize> = None;
+                                                if let Some(ref text) = llm_candidate_review {
                                                     options.push(ReviewOption {
                                                         choice: ReviewChoice::Final,
                                                         text: text.clone(),
+                                                        safe: llm_candidate_safe,
                                                     });
+                                                    final_index = Some(options.len() - 1);
                                                 }
-                                                if let Some(ref text) = accuracy_candidate {
+
+                                                let mut accuracy_index: Option<usize> = None;
+                                                if let Some(ref text) = accuracy_candidate_review {
                                                     options.push(ReviewOption {
                                                         choice: ReviewChoice::Accuracy,
                                                         text: text.clone(),
+                                                        safe: accuracy_candidate_safe,
                                                     });
+                                                    accuracy_index = Some(options.len() - 1);
                                                 }
+
                                                 options.push(ReviewOption {
                                                     choice: ReviewChoice::Cancel,
                                                     text: "Cancel (do not paste)".to_string(),
+                                                    safe: true,
                                                 });
 
-                                                let selected = if llm_candidate.is_some() {
-                                                    1
-                                                } else if accuracy_candidate.is_some() {
-                                                    1
+                                                let selected = if let Some(idx) = accuracy_index {
+                                                    idx
+                                                } else if let Some(idx) = final_index {
+                                                    idx
                                                 } else {
                                                     0
                                                 };
@@ -1469,10 +1567,26 @@ async fn main() -> Result<()> {
                                                 review_shown = true;
 
                                                 let mut pasted = false;
+                                                let raw_for_log = paragraph.clone();
+                                                let llm_for_log = llm_candidate_review.clone();
+                                                let accuracy_for_log = accuracy_candidate_review.clone();
+                                                let model_for_log = overlay_model_label.clone();
                                                 loop {
                                                     if let Some(response) = handle.try_recv() {
                                                         match response {
-                                                            OverlayResponse::PasteText(text) => {
+                                                            OverlayResponse::ReviewSelection { choice, text } => {
+                                                                log_review_decision(
+                                                                    profile,
+                                                                    accuracy_on,
+                                                                    &model_for_log,
+                                                                    &raw_for_log,
+                                                                    llm_for_log.as_deref(),
+                                                                    llm_candidate_safe,
+                                                                    accuracy_for_log.as_deref(),
+                                                                    accuracy_candidate_safe,
+                                                                    choice,
+                                                                    &text,
+                                                                );
                                                                 eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
                                                                 if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
                                                                     eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
@@ -1481,6 +1595,18 @@ async fn main() -> Result<()> {
                                                                 break;
                                                             }
                                                             OverlayResponse::Cancel => {
+                                                                log_review_decision(
+                                                                    profile,
+                                                                    accuracy_on,
+                                                                    &model_for_log,
+                                                                    &raw_for_log,
+                                                                    llm_for_log.as_deref(),
+                                                                    llm_candidate_safe,
+                                                                    accuracy_for_log.as_deref(),
+                                                                    accuracy_candidate_safe,
+                                                                    ReviewChoice::Cancel,
+                                                                    "",
+                                                                );
                                                                 eprintln!("[TOGGLE-OFF] Review canceled");
                                                                 break;
                                                             }

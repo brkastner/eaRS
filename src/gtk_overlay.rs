@@ -82,6 +82,7 @@ pub enum ReviewChoice {
 pub struct ReviewOption {
     pub choice: ReviewChoice,
     pub text: String,
+    pub safe: bool,
 }
 
 impl ReviewOption {
@@ -104,6 +105,8 @@ pub enum OverlayResponse {
     Closed,
     /// Review was canceled
     Cancel,
+    /// Review selection
+    ReviewSelection { choice: ReviewChoice, text: String },
 }
 
 /// Handle to communicate with the overlay from the main thread
@@ -279,6 +282,10 @@ window {
     font-weight: 600;
 }
 
+.review-unsafe {
+    color: rgba(255, 140, 140, 1.0);
+}
+
 .review-text {
     color: rgba(230, 230, 230, 0.95);
     font-size: 14px;
@@ -385,8 +392,16 @@ impl OverlayState {
                 item.add_css_class("review-selected");
             }
 
-            let label = Label::new(Some(option.label()));
+            let label_text = if option.safe || matches!(option.choice, ReviewChoice::Raw | ReviewChoice::Cancel) {
+                option.label().to_string()
+            } else {
+                format!("{} (rejected)", option.label())
+            };
+            let label = Label::new(Some(&label_text));
             label.add_css_class("review-label");
+            if !option.safe && !matches!(option.choice, ReviewChoice::Raw | ReviewChoice::Cancel) {
+                label.add_css_class("review-unsafe");
+            }
             label.set_halign(gtk4::Align::Start);
             label.set_xalign(0.0);
 
@@ -457,8 +472,8 @@ fn build_window(
         }
     }
 
-    let review_width = ((monitor_width as f32) * 0.75) as i32;
-    let review_height = ((monitor_height as f32) * 0.75) as i32;
+    let review_width = ((monitor_width as f32) * 0.50) as i32;
+    let review_height = ((monitor_height as f32) * 0.50) as i32;
 
     let center_window = move |window: &ApplicationWindow, width: i32, height: i32| {
         let offset_x = ((monitor_width - width) / 2).max(0);
@@ -571,7 +586,7 @@ fn build_window(
                 }
                 glib::Propagation::Stop
             }
-            gdk::Key::Right | gdk::Key::Return => {
+            gdk::Key::Right | gdk::Key::Return | gdk::Key::KP_Enter => {
                 let selected = state.review_options.get(state.review_selected).cloned();
                 state.review_active = false;
                 state.review_options.clear();
@@ -590,7 +605,10 @@ fn build_window(
                             let _ = response_tx_clone.send(OverlayResponse::Cancel);
                         }
                         _ => {
-                            let _ = response_tx_clone.send(OverlayResponse::PasteText(option.text));
+                            let _ = response_tx_clone.send(OverlayResponse::ReviewSelection {
+                                choice: option.choice,
+                                text: option.text,
+                            });
                         }
                     }
                 }
