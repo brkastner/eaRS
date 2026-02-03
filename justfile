@@ -10,6 +10,9 @@ help:
 build:
     cargo build --release --features "parakeet,amd,llm-correct,hooks,preview-overlay"
 
+summarize:
+    ./scripts/review-history-summary.py
+
 # Check compilation without building
 check:
     cargo check --all-features
