@@ -45,6 +45,8 @@ pub enum OverlayCommand {
     Status(OverlayStatus),
     /// Update the info text
     Info(String),
+    /// Show review menu with candidate options
+    Review { options: Vec<ReviewOption>, selected: usize },
 }
 
 /// Status indicator for the overlay
@@ -54,6 +56,7 @@ pub enum OverlayStatus {
     Listening,
     Correcting,
     Paused,
+    Review,
 }
 
 impl OverlayStatus {
@@ -62,6 +65,32 @@ impl OverlayStatus {
             OverlayStatus::Listening => "listening",
             OverlayStatus::Correcting => "correcting...",
             OverlayStatus::Paused => "paused",
+            OverlayStatus::Review => "review (↑/↓ select, → paste)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewChoice {
+    Raw,
+    Final,
+    Accuracy,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewOption {
+    pub choice: ReviewChoice,
+    pub text: String,
+}
+
+impl ReviewOption {
+    pub fn label(&self) -> &'static str {
+        match self.choice {
+            ReviewChoice::Raw => "RAW",
+            ReviewChoice::Final => "FINAL",
+            ReviewChoice::Accuracy => "ACCURACY",
+            ReviewChoice::Cancel => "CANCEL",
         }
     }
 }
@@ -73,6 +102,8 @@ pub enum OverlayResponse {
     PasteText(String),
     /// Overlay was closed
     Closed,
+    /// Review was canceled
+    Cancel,
 }
 
 /// Handle to communicate with the overlay from the main thread
@@ -135,6 +166,13 @@ impl OverlayHandle {
         self.command_tx
             .send_blocking(OverlayCommand::Info(info))
             .map_err(|e| anyhow::anyhow!("Failed to send info to overlay: {}", e))
+    }
+
+    /// Show review options
+    pub fn show_review(&self, options: Vec<ReviewOption>, selected: usize) -> Result<()> {
+        self.command_tx
+            .send_blocking(OverlayCommand::Review { options, selected })
+            .map_err(|e| anyhow::anyhow!("Failed to send review options to overlay: {}", e))
     }
 
 
@@ -210,6 +248,11 @@ window {
     font-size: 14px;
 }
 
+.status-review {
+    color: rgba(220, 180, 80, 1);
+    font-size: 14px;
+}
+
 .word-count {
     color: rgba(100, 100, 100, 0.8);
     font-size: 13px;
@@ -219,6 +262,26 @@ window {
 .info-text {
     color: rgba(160, 160, 160, 0.9);
     font-size: 12px;
+}
+
+.review-item {
+    padding: 6px 8px;
+    border-radius: 6px;
+}
+
+.review-selected {
+    background-color: rgba(80, 100, 160, 0.35);
+}
+
+.review-label {
+    color: rgba(200, 200, 200, 0.9);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.review-text {
+    color: rgba(230, 230, 230, 0.95);
+    font-size: 14px;
 }
 
 separator {
@@ -243,6 +306,9 @@ fn load_css() {
 struct OverlayState {
     buffer: PreviewBuffer,
     status: OverlayStatus,
+    review_active: bool,
+    review_options: Vec<ReviewOption>,
+    review_selected: usize,
     response_tx: Sender<OverlayResponse>,
     content_box: GtkBox,
     status_label: Label,
@@ -255,6 +321,13 @@ impl OverlayState {
         // Clear existing children
         while let Some(child) = self.content_box.first_child() {
             self.content_box.remove(&child);
+        }
+
+        if self.review_active {
+            self.update_review_display();
+            self.word_count_label
+                .set_label("↑/↓ select · → paste · Esc cancel");
+            return;
         }
 
         let sections = self.buffer.display_sections();
@@ -295,17 +368,52 @@ impl OverlayState {
             .set_label(&format!("{} words", self.buffer.active_word_count()));
     }
 
+    fn update_review_display(&self) {
+        if self.review_options.is_empty() {
+            let label = Label::new(Some("No review options"));
+            label.add_css_class("waiting-text");
+            label.set_wrap(true);
+            label.set_xalign(0.0);
+            self.content_box.append(&label);
+            return;
+        }
+
+        for (idx, option) in self.review_options.iter().enumerate() {
+            let item = GtkBox::new(Orientation::Vertical, 2);
+            item.add_css_class("review-item");
+            if idx == self.review_selected {
+                item.add_css_class("review-selected");
+            }
+
+            let label = Label::new(Some(option.label()));
+            label.add_css_class("review-label");
+            label.set_halign(gtk4::Align::Start);
+            label.set_xalign(0.0);
+
+            let text = Label::new(Some(option.text.as_str()));
+            text.add_css_class("review-text");
+            text.set_wrap(true);
+            text.set_xalign(0.0);
+
+            item.append(&label);
+            item.append(&text);
+            self.content_box.append(&item);
+        }
+    }
+
     fn update_status_display(&self) {
         // Remove old status classes
         self.status_label.remove_css_class("status-listening");
         self.status_label.remove_css_class("status-correcting");
         self.status_label.remove_css_class("status-paused");
+        self.status_label.remove_css_class("status-review");
 
         // Add new status class
         let class = match self.status {
             OverlayStatus::Listening => "status-listening",
             OverlayStatus::Correcting => "status-correcting",
             OverlayStatus::Paused => "status-paused",
+            OverlayStatus::Review => "status-review",
         };
         self.status_label.add_css_class(class);
         self.status_label.set_label(self.status.as_str());
@@ -335,31 +443,36 @@ fn build_window(
     window.set_layer(gtk4_layer_shell::Layer::Overlay);
     window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
 
-    // Position at center of the primary monitor
+    let default_width = window_width as i32;
+    let default_height = window_height as i32;
+    let mut monitor_width = default_width + 64;
+    let mut monitor_height = default_height + 64;
+
     if let Some(display) = gtk4::gdk::Display::default() {
         let monitor = display.monitors().item(0).and_downcast::<gtk4::gdk::Monitor>();
         if let Some(monitor) = monitor {
             let geometry = monitor.geometry();
-            let offset_x = ((geometry.width() - window_width as i32) / 2).max(0);
-            let offset_y = ((geometry.height() - window_height as i32) / 2).max(0);
-            window.set_anchor(gtk4_layer_shell::Edge::Top, true);
-            window.set_anchor(gtk4_layer_shell::Edge::Left, true);
-            window.set_anchor(gtk4_layer_shell::Edge::Bottom, false);
-            window.set_anchor(gtk4_layer_shell::Edge::Right, false);
-            window.set_margin(gtk4_layer_shell::Edge::Left, offset_x);
-            window.set_margin(gtk4_layer_shell::Edge::Top, offset_y);
-        } else {
-            window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
-            window.set_anchor(gtk4_layer_shell::Edge::Right, true);
-            window.set_margin(gtk4_layer_shell::Edge::Bottom, 32);
-            window.set_margin(gtk4_layer_shell::Edge::Right, 32);
+            monitor_width = geometry.width();
+            monitor_height = geometry.height();
         }
-    } else {
-        window.set_anchor(gtk4_layer_shell::Edge::Bottom, true);
-        window.set_anchor(gtk4_layer_shell::Edge::Right, true);
-        window.set_margin(gtk4_layer_shell::Edge::Bottom, 32);
-        window.set_margin(gtk4_layer_shell::Edge::Right, 32);
     }
+
+    let review_width = ((monitor_width as f32) * 0.75) as i32;
+    let review_height = ((monitor_height as f32) * 0.75) as i32;
+
+    let center_window = move |window: &ApplicationWindow, width: i32, height: i32| {
+        let offset_x = ((monitor_width - width) / 2).max(0);
+        let offset_y = ((monitor_height - height) / 2).max(0);
+        window.set_default_size(width, height);
+        window.set_anchor(gtk4_layer_shell::Edge::Top, true);
+        window.set_anchor(gtk4_layer_shell::Edge::Left, true);
+        window.set_anchor(gtk4_layer_shell::Edge::Bottom, false);
+        window.set_anchor(gtk4_layer_shell::Edge::Right, false);
+        window.set_margin(gtk4_layer_shell::Edge::Left, offset_x);
+        window.set_margin(gtk4_layer_shell::Edge::Top, offset_y);
+    };
+
+    center_window(&window, default_width, default_height);
 
     // Set namespace for compositor identification
     window.set_namespace("eaRS-dictation-overlay");
@@ -414,9 +527,13 @@ fn build_window(
     window.set_child(Some(&main_box));
 
     // Create state
+    let response_tx_clone = response_tx.clone();
     let state = Rc::new(RefCell::new(OverlayState {
         buffer: PreviewBuffer::new(),
         status: OverlayStatus::Listening,
+        review_active: false,
+        review_options: Vec::new(),
+        review_selected: 0,
         response_tx,
         content_box,
         status_label,
@@ -427,6 +544,77 @@ fn build_window(
     // Initial display
     state.borrow().update_display();
     state.borrow().update_status_display();
+
+    // Key handling for review mode
+    let state_key = state.clone();
+    let window_key = window.clone();
+    let key_controller = gtk4::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |_, key, _, _| {
+        let mut state = state_key.borrow_mut();
+        if !state.review_active {
+            return glib::Propagation::Proceed;
+        }
+
+        let option_count = state.review_options.len();
+        match key {
+            gdk::Key::Up => {
+                if option_count > 0 {
+                    state.review_selected = (state.review_selected + option_count - 1) % option_count;
+                    state.update_display();
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::Down => {
+                if option_count > 0 {
+                    state.review_selected = (state.review_selected + 1) % option_count;
+                    state.update_display();
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::Right | gdk::Key::Return => {
+                let selected = state.review_options.get(state.review_selected).cloned();
+                state.review_active = false;
+                state.review_options.clear();
+                state.status = OverlayStatus::Paused;
+                state.update_status_display();
+                state.update_display();
+                drop(state);
+
+                window_key.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+                window_key.set_visible(false);
+                center_window(&window_key, default_width, default_height);
+
+                if let Some(option) = selected {
+                    match option.choice {
+                        ReviewChoice::Cancel => {
+                            let _ = response_tx_clone.send(OverlayResponse::Cancel);
+                        }
+                        _ => {
+                            let _ = response_tx_clone.send(OverlayResponse::PasteText(option.text));
+                        }
+                    }
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                state.review_active = false;
+                state.review_options.clear();
+                state.status = OverlayStatus::Paused;
+                state.update_status_display();
+                state.update_display();
+                drop(state);
+
+                window_key.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
+                window_key.set_visible(false);
+                center_window(&window_key, default_width, default_height);
+
+                let _ = response_tx_clone.send(OverlayResponse::Cancel);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    window.add_controller(key_controller);
 
     // Handle commands from main thread using spawn_local
     let state_clone = state.clone();
@@ -454,6 +642,9 @@ fn build_window(
                     state.update_display();
                 }
                 OverlayCommand::Commit => {
+                    state.review_active = false;
+                    state.review_options.clear();
+                    center_window(&window_clone, default_width, default_height);
                     if let Some(text) = state.buffer.commit() {
                         let _ = state.response_tx.send(OverlayResponse::PasteText(text));
                     }
@@ -462,6 +653,9 @@ fn build_window(
                     window_clone.set_visible(false);
                 }
                 OverlayCommand::Close => {
+                    state.review_active = false;
+                    state.review_options.clear();
+                    center_window(&window_clone, default_width, default_height);
                     state.buffer.clear();
                     state.update_display();
                     drop(state);
@@ -473,6 +667,19 @@ fn build_window(
                 }
                 OverlayCommand::Info(info) => {
                     state.update_info(&info);
+                }
+                OverlayCommand::Review { options, selected } => {
+                    state.review_active = true;
+                    state.review_options = options;
+                    state.review_selected = selected.min(state.review_options.len().saturating_sub(1));
+                    state.status = OverlayStatus::Review;
+                    state.update_status_display();
+                    state.update_display();
+                    drop(state);
+                    center_window(&window_clone, review_width.max(default_width), review_height.max(default_height));
+                    window_clone.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::Exclusive);
+                    window_clone.set_visible(true);
+                    window_clone.present();
                 }
                 OverlayCommand::Show => {
                     drop(state);
@@ -492,6 +699,8 @@ fn build_window(
     let window_close = window.clone();
     window.connect_close_request(move |_| {
         let mut state = state_close.borrow_mut();
+        state.review_active = false;
+        state.review_options.clear();
         state.buffer.clear();
         state.update_display();
         drop(state);

@@ -17,7 +17,7 @@ use ears::virtual_keyboard::{
 #[cfg(feature = "preview-overlay")]
 use ears::clipboard::copy_and_paste;
 #[cfg(feature = "preview-overlay")]
-use ears::gtk_overlay::{spawn_overlay, OverlayHandle, OverlayResponse, OverlayStatus};
+use ears::gtk_overlay::{spawn_overlay, OverlayHandle, OverlayResponse, OverlayStatus, ReviewChoice, ReviewOption};
 use futures_util::{SinkExt, StreamExt};
 use notifica::notify;
 use rdev::{EventType, listen};
@@ -74,6 +74,13 @@ fn parse_env_f32(key: &str, default_value: f32) -> f32 {
     env::var(key)
         .ok()
         .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(default_value)
+}
+
+fn parse_env_u64(key: &str, default_value: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(default_value)
 }
 
@@ -555,8 +562,8 @@ async fn main() -> Result<()> {
     let capturing = Arc::new(Mutex::new(false));
     let capture_grace_until = Arc::new(Mutex::new(None::<Instant>));
     let accuracy_buffer = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-    let accuracy_enabled = !args.accuracy_url.trim().is_empty();
-    let accuracy_max_samples = if accuracy_enabled {
+    let accuracy_buffer_enabled = !args.accuracy_url.trim().is_empty();
+    let accuracy_max_samples = if accuracy_buffer_enabled {
         (args.accuracy_max_seconds as usize) * 24_000
     } else {
         0
@@ -578,6 +585,7 @@ async fn main() -> Result<()> {
     let (discard_tx, discard_rx) = bounded::<()>(1);
     let (accuracy_toggle_tx, accuracy_toggle_rx) = unbounded::<()>();
     let accuracy_enabled = Arc::new(AtomicBool::new(args.accuracy_enabled));
+    let preview_autocommit_secs = parse_env_u64("EARS_PREVIEW_AUTOCOMMIT_SECS", AUTO_COMMIT_PAUSE_SECS);
 
     // Preview mode flag (set by --preview arg)
     #[cfg(feature = "preview-overlay")]
@@ -1130,14 +1138,9 @@ async fn main() -> Result<()> {
                                         overlay_closed_logged = true;
                                     }
                                 }
+                                OverlayResponse::Cancel => {}
                             }
                         }
-                    }
-
-                    // Set overlay_handle to None if overlay was closed (check channel disconnect)
-                    #[cfg(feature = "preview-overlay")]
-                    if overlay_closed_logged && overlay_handle.is_some() {
-                        overlay_handle = None;
                     }
 
                     #[cfg(feature = "preview-overlay")]
@@ -1357,6 +1360,8 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                     }
+                                    let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
+                                    let mut review_shown = false;
                                     // Run final correction through overlay
                                     if correction_buffer.paragraph_len() >= 2 {
                                         if let Some(ref handle) = overlay_handle {
@@ -1380,10 +1385,10 @@ async fn main() -> Result<()> {
                                             Err(e) => eprintln!("[TOGGLE-OFF FINAL ERROR] {}", e),
                                         }
 
+                                        let mut accuracy_candidate: Option<String> = None;
                                         let mut final_text: Option<String> = None;
                                         if matches!(profile, CorrectionProfile::Technical) {
-                                            let mut accuracy_candidate: Option<String> = None;
-                                            if should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed)) {
+                                            if accuracy_on {
                                                 if let Ok(Some(accuracy_text)) = run_accuracy_pass(&accuracy_buffer, &args).await {
                                                     let normalized = normalize_accuracy_text(&paragraph, &accuracy_text);
                                                     let processed = postprocess_candidate(profile, &normalized);
@@ -1399,7 +1404,7 @@ async fn main() -> Result<()> {
                                             }
 
                                             if let Some((chosen_text, source)) =
-                                                choose_best_correction(&paragraph, llm_candidate, accuracy_candidate)
+                                                choose_best_correction(&paragraph, llm_candidate.clone(), accuracy_candidate.clone())
                                             {
                                                 if chosen_text != paragraph {
                                                     eprintln!("[TOGGLE-OFF APPLY] source={:?} '{}' -> '{}'", source, paragraph, chosen_text);
@@ -1407,11 +1412,11 @@ async fn main() -> Result<()> {
                                                 }
                                             }
                                         } else {
-                                            if let Some(corrected) = llm_candidate {
+                                            if let Some(corrected) = llm_candidate.clone() {
                                                 final_text = Some(corrected);
                                             }
 
-                                            if should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed)) {
+                                            if accuracy_on {
                                                 if let Ok(Some(accuracy_text)) = run_accuracy_pass(&accuracy_buffer, &args).await {
                                                     let normalized = normalize_accuracy_text(&paragraph, &accuracy_text);
                                                     let processed = postprocess_candidate(profile, &normalized);
@@ -1420,6 +1425,7 @@ async fn main() -> Result<()> {
                                                         && is_safe_correction(base, &processed, profile)
                                                     {
                                                         eprintln!("[TOGGLE-OFF ACCURACY] '{}' -> '{}'", base, processed);
+                                                        accuracy_candidate = Some(processed.clone());
                                                         final_text = Some(processed);
                                                     } else {
                                                         eprintln!("[TOGGLE-OFF ACCURACY] No changes needed");
@@ -1428,35 +1434,100 @@ async fn main() -> Result<()> {
                                             }
                                         }
 
-                                        if let Some(text) = final_text {
+                                        if accuracy_on {
                                             if let Some(ref handle) = overlay_handle {
-                                                let _ = handle.send_correction(text);
+                                                let mut options = Vec::new();
+                                                options.push(ReviewOption {
+                                                    choice: ReviewChoice::Raw,
+                                                    text: paragraph.clone(),
+                                                });
+                                                if let Some(ref text) = llm_candidate {
+                                                    options.push(ReviewOption {
+                                                        choice: ReviewChoice::Final,
+                                                        text: text.clone(),
+                                                    });
+                                                }
+                                                if let Some(ref text) = accuracy_candidate {
+                                                    options.push(ReviewOption {
+                                                        choice: ReviewChoice::Accuracy,
+                                                        text: text.clone(),
+                                                    });
+                                                }
+                                                options.push(ReviewOption {
+                                                    choice: ReviewChoice::Cancel,
+                                                    text: "Cancel (do not paste)".to_string(),
+                                                });
+
+                                                let selected = if llm_candidate.is_some() {
+                                                    1
+                                                } else if accuracy_candidate.is_some() {
+                                                    1
+                                                } else {
+                                                    0
+                                                };
+                                                let _ = handle.show_review(options, selected);
+                                                review_shown = true;
+
+                                                let mut pasted = false;
+                                                loop {
+                                                    if let Some(response) = handle.try_recv() {
+                                                        match response {
+                                                            OverlayResponse::PasteText(text) => {
+                                                                eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
+                                                                if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
+                                                                    eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
+                                                                }
+                                                                pasted = true;
+                                                                break;
+                                                            }
+                                                            OverlayResponse::Cancel => {
+                                                                eprintln!("[TOGGLE-OFF] Review canceled");
+                                                                break;
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                                }
+                                                if pasted {
+                                                    let _ = handle.close();
+                                                } else {
+                                                    let _ = handle.close();
+                                                }
+                                            }
+                                        } else {
+                                            if let Some(text) = final_text {
+                                                if let Some(ref handle) = overlay_handle {
+                                                    let _ = handle.send_correction(text);
+                                                }
                                             }
                                         }
                                     }
                                     // Commit overlay (paste buffer, close window)
                                     if let Some(ref handle) = overlay_handle {
-                                        eprintln!("[TOGGLE-OFF] Committing overlay");
-                                        let _ = handle.commit();
-                                        let paste_deadline = Instant::now()
-                                            + std::time::Duration::from_millis(1500);
-                                        let mut pasted = false;
-                                        loop {
-                                            if let Some(response) = handle.try_recv() {
-                                                if let OverlayResponse::PasteText(text) = response {
-                                                    eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
-                                                    if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
-                                                        eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
+                                        if !review_shown {
+                                            eprintln!("[TOGGLE-OFF] Committing overlay");
+                                            let _ = handle.commit();
+                                            let paste_deadline = Instant::now()
+                                                + std::time::Duration::from_millis(1500);
+                                            let mut pasted = false;
+                                            loop {
+                                                if let Some(response) = handle.try_recv() {
+                                                    if let OverlayResponse::PasteText(text) = response {
+                                                        eprintln!("[TOGGLE-OFF] Pasting text: {} chars", text.len());
+                                                        if let Err(e) = copy_and_paste(&text, keyboard.as_mut(), &paste_hotkey) {
+                                                            eprintln!("[TOGGLE-OFF PASTE ERROR] {}", e);
+                                                        }
+                                                        pasted = true;
                                                     }
-                                                    pasted = true;
                                                 }
+                                                if pasted || Instant::now() >= paste_deadline {
+                                                    break;
+                                                }
+                                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                                             }
-                                            if pasted || Instant::now() >= paste_deadline {
-                                                break;
-                                            }
-                                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                            let _ = handle.hide();
                                         }
-                                        let _ = handle.hide();
                                     }
                                     overlay_closed_logged = false;
                                     overlay_word_count = 0;
@@ -1749,9 +1820,10 @@ async fn main() -> Result<()> {
                                     }
 
                                     // Auto-commit after extended silence (10+ seconds)
-                                    if is_capturing
+                                    if preview_autocommit_secs > 0
+                                        && is_capturing
                                         && overlay_handle.is_some()
-                                        && elapsed.as_secs() >= AUTO_COMMIT_PAUSE_SECS
+                                        && elapsed.as_secs() >= preview_autocommit_secs
                                         && correction_buffer.paragraph_len() > 0
                                     {
                                         eprintln!(
