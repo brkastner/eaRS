@@ -87,6 +87,10 @@ pub struct PreviewConfig {
     pub commit_hotkey: String,
     /// Hotkey to checkpoint (paste current buffer, continue) (e.g., "kp_add")
     pub checkpoint_hotkey: String,
+    /// Hotkey to trigger breakpoint (correct + checkpoint, continue)
+    pub breakpoint_hotkey: String,
+    /// Show review popup on breakpoint (false = auto-apply best correction)
+    pub breakpoint_review: bool,
     /// Hotkey to paste from clipboard (e.g., "ctrl+v")
     pub paste_hotkey: String,
     /// Window width in pixels
@@ -102,6 +106,8 @@ impl Default for PreviewConfig {
             enabled: false,
             commit_hotkey: "ctrl+shift+Return".to_string(),
             checkpoint_hotkey: "KpAdd".to_string(),
+            breakpoint_hotkey: "KpSubtract".to_string(),
+            breakpoint_review: false,
             paste_hotkey: "ctrl+shift+v".to_string(),
             window_width: 400,
             window_height: 300,

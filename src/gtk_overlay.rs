@@ -35,6 +35,10 @@ pub enum OverlayCommand {
     Checkpoint,
     /// Commit requested (paste all, close)
     Commit,
+    /// Breakpoint started (set status to correcting)
+    BreakpointStart,
+    /// Breakpoint completed (commit corrected text, preserve new words)
+    BreakpointComplete { corrected: String, boundary: usize },
     /// Close the overlay without committing
     Close,
     /// Show the overlay window
@@ -65,7 +69,7 @@ impl OverlayStatus {
             OverlayStatus::Listening => "listening",
             OverlayStatus::Correcting => "correcting...",
             OverlayStatus::Paused => "paused",
-            OverlayStatus::Review => "review (↑/↓ select, → paste)",
+            OverlayStatus::Review => "review (↑/↓ select, → accept, P mode)",
         }
     }
 }
@@ -155,6 +159,20 @@ impl OverlayHandle {
         self.command_tx
             .send_blocking(OverlayCommand::Commit)
             .map_err(|e| anyhow::anyhow!("Failed to send commit to overlay: {}", e))
+    }
+
+    /// Request a breakpoint start (set status to correcting)
+    pub fn breakpoint_start(&self) -> Result<()> {
+        self.command_tx
+            .send_blocking(OverlayCommand::BreakpointStart)
+            .map_err(|e| anyhow::anyhow!("Failed to send breakpoint start to overlay: {}", e))
+    }
+
+    /// Complete a breakpoint (commit corrected text, preserve new words)
+    pub fn breakpoint_complete(&self, corrected: String, boundary: usize) -> Result<()> {
+        self.command_tx
+            .send_blocking(OverlayCommand::BreakpointComplete { corrected, boundary })
+            .map_err(|e| anyhow::anyhow!("Failed to send breakpoint complete to overlay: {}", e))
     }
 
     /// Update the status indicator
@@ -316,8 +334,7 @@ struct OverlayState {
     review_active: bool,
     review_options: Vec<ReviewOption>,
     review_selected: usize,
-    pending_selection: Option<ReviewOption>,
-    pending_type_output: bool,
+    review_type_output: bool,
     response_tx: Sender<OverlayResponse>,
     scrolled: ScrolledWindow,
     content_box: GtkBox,
@@ -335,13 +352,11 @@ impl OverlayState {
 
         if self.review_active {
             self.update_review_display();
-            if self.pending_selection.is_some() && self.pending_type_output {
-                self.word_count_label
-                    .set_label("release shift to type");
-            } else {
-                self.word_count_label
-                    .set_label("↑/↓ select · → paste · Esc cancel");
-            }
+            let mode_label = if self.review_type_output { "type" } else { "paste" };
+            self.word_count_label.set_label(&format!(
+                "↑/↓ select · → accept · P mode: {} · Esc cancel",
+                mode_label
+            ));
             return;
         }
 
@@ -573,8 +588,7 @@ fn build_window(
         review_active: false,
         review_options: Vec::new(),
         review_selected: 0,
-        pending_selection: None,
-        pending_type_output: false,
+        review_type_output: false,
         response_tx,
         scrolled: scrolled.clone(),
         content_box,
@@ -592,17 +606,13 @@ fn build_window(
     let window_key = window.clone();
     let key_controller = gtk4::EventControllerKey::new();
     let response_tx_key = response_tx_clone.clone();
-    key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+    key_controller.connect_key_pressed(move |_, key, _, _| {
         let mut state = state_key.borrow_mut();
         if !state.review_active {
             return glib::Propagation::Proceed;
         }
-        if state.pending_selection.is_some() && state.pending_type_output {
-            return glib::Propagation::Stop;
-        }
 
         let option_count = state.review_options.len();
-        let type_output = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
         match key {
             gdk::Key::Up => {
                 if option_count > 0 {
@@ -618,19 +628,16 @@ fn build_window(
                 }
                 glib::Propagation::Stop
             }
+            gdk::Key::p | gdk::Key::P => {
+                state.review_type_output = !state.review_type_output;
+                state.update_display();
+                glib::Propagation::Stop
+            }
             gdk::Key::Right | gdk::Key::Return | gdk::Key::KP_Enter => {
                 let selected = state.review_options.get(state.review_selected).cloned();
-                if type_output {
-                    state.pending_selection = selected;
-                    state.pending_type_output = true;
-                    state.update_display();
-                    return glib::Propagation::Stop;
-                }
-
+                let type_output = state.review_type_output;
                 state.review_active = false;
                 state.review_options.clear();
-                state.pending_selection = None;
-                state.pending_type_output = false;
                 state.status = OverlayStatus::Paused;
                 state.update_status_display();
                 state.update_display();
@@ -659,8 +666,6 @@ fn build_window(
             gdk::Key::Escape => {
                 state.review_active = false;
                 state.review_options.clear();
-                state.pending_selection = None;
-                state.pending_type_output = false;
                 state.status = OverlayStatus::Paused;
                 state.update_status_display();
                 state.update_display();
@@ -675,49 +680,6 @@ fn build_window(
             }
             _ => glib::Propagation::Proceed,
         }
-    });
-    let state_release = state.clone();
-    let window_release = window.clone();
-    let response_tx_release = response_tx_clone.clone();
-    key_controller.connect_key_released(move |_, key, _, modifiers| {
-        let mut state = state_release.borrow_mut();
-        if !state.review_active || state.pending_selection.is_none() {
-            return glib::Propagation::Proceed;
-        }
-        if !matches!(key, gdk::Key::Shift_L | gdk::Key::Shift_R) {
-            return glib::Propagation::Stop;
-        }
-        if modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
-            return glib::Propagation::Stop;
-        }
-        let selected = state.pending_selection.take();
-        state.pending_type_output = false;
-        state.review_active = false;
-        state.review_options.clear();
-        state.status = OverlayStatus::Paused;
-        state.update_status_display();
-        state.update_display();
-        drop(state);
-
-        window_release.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::None);
-        window_release.set_visible(false);
-        center_window(&window_release, default_width, default_height);
-
-        if let Some(option) = selected {
-            match option.choice {
-                ReviewChoice::Cancel => {
-                    let _ = response_tx_release.send(OverlayResponse::Cancel);
-                }
-                _ => {
-                    let _ = response_tx_release.send(OverlayResponse::ReviewSelection {
-                        choice: option.choice,
-                        text: option.text,
-                        type_output: true,
-                    });
-                }
-            }
-        }
-        glib::Propagation::Stop
     });
     window.add_controller(key_controller);
 
@@ -756,6 +718,16 @@ fn build_window(
                     state.update_display();
                     drop(state);
                     window_clone.set_visible(false);
+                }
+                OverlayCommand::BreakpointStart => {
+                    state.status = OverlayStatus::Correcting;
+                    state.update_status_display();
+                }
+                OverlayCommand::BreakpointComplete { corrected, boundary } => {
+                    state.buffer.breakpoint_complete(corrected, boundary);
+                    state.status = OverlayStatus::Listening;
+                    state.update_status_display();
+                    state.update_display();
                 }
                 OverlayCommand::Close => {
                     state.review_active = false;
