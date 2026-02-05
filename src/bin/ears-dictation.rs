@@ -693,6 +693,8 @@ async fn main() -> Result<()> {
     let (commit_tx, commit_rx) = bounded::<()>(1);
     let (respawn_overlay_tx, respawn_overlay_rx) = bounded::<()>(1);
     let (discard_tx, discard_rx) = bounded::<()>(1);
+    let (breakpoint_tx, breakpoint_rx) = bounded::<()>(1);
+    let breakpoint_in_progress = Arc::new(AtomicBool::new(false));
     let (accuracy_toggle_tx, accuracy_toggle_rx) = unbounded::<()>();
     let accuracy_enabled = Arc::new(AtomicBool::new(args.accuracy_enabled));
     let preview_autocommit_secs = parse_env_u64("EARS_PREVIEW_AUTOCOMMIT_SECS", AUTO_COMMIT_PAUSE_SECS);
@@ -708,6 +710,8 @@ async fn main() -> Result<()> {
     let preview_window_width = config.dictation.preview.window_width;
     #[cfg(feature = "preview-overlay")]
     let preview_window_height = config.dictation.preview.window_height;
+    #[cfg(feature = "preview-overlay")]
+    let breakpoint_review = config.dictation.preview.breakpoint_review;
 
     // Store paste hotkey for clipboard operations
     #[cfg(feature = "preview-overlay")]
@@ -826,6 +830,29 @@ async fn main() -> Result<()> {
         });
     }
 
+    // SIGRTMIN+2 triggers breakpoint (correct + checkpoint, continue)
+    #[cfg(feature = "preview-overlay")]
+    {
+        let sig_breakpoint_tx = breakpoint_tx.clone();
+        let sig_breakpoint_flag = breakpoint_in_progress.clone();
+        tokio::spawn(async move {
+            let mut sigrtmin2 = signal(SignalKind::from_raw(libc::SIGRTMIN() + 2))
+                .expect("failed to register SIGRTMIN+2 handler");
+            loop {
+                sigrtmin2.recv().await;
+                if sig_breakpoint_flag
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    eprintln!("SIGRTMIN+2: breakpoint requested");
+                    let _ = sig_breakpoint_tx.send(());
+                } else {
+                    eprintln!("SIGRTMIN+2: breakpoint already in progress, ignoring");
+                }
+            }
+        });
+    }
+
     let hotkey_running = running.clone();
     let hotkey_capturing = capturing.clone();
     let hotkey_grace = capture_grace_until.clone();
@@ -847,6 +874,10 @@ async fn main() -> Result<()> {
         let hotkey_checkpoint_tx = checkpoint_tx.clone();
         let hotkey_commit_tx = commit_tx.clone();
         let hotkey_accuracy_tx = accuracy_toggle_tx.clone();
+        #[cfg(feature = "preview-overlay")]
+        let hotkey_breakpoint_tx = breakpoint_tx.clone();
+        #[cfg(feature = "preview-overlay")]
+        let hotkey_breakpoint_flag = breakpoint_in_progress.clone();
         #[cfg(feature = "preview-overlay")]
         let preview_config_hotkeys = config.dictation.preview.clone();
         let _hotkey_preview_mode = preview_mode;
@@ -875,6 +906,15 @@ async fn main() -> Result<()> {
                 let combo = parse_combo(&preview_config_hotkeys.commit_hotkey);
                 eprintln!("Commit hotkey: {} -> ctrl:{} shift:{} alt:{} key:{:?}",
                          preview_config_hotkeys.commit_hotkey, combo.0, combo.1, combo.2, combo.3);
+                combo
+            } else {
+                (false, false, false, rdev::Key::Unknown(0))
+            };
+            #[cfg(feature = "preview-overlay")]
+            let (bp_ctrl, bp_shift, bp_alt, bp_key) = if hotkey_preview_mode {
+                let combo = parse_combo(&preview_config_hotkeys.breakpoint_hotkey);
+                eprintln!("Breakpoint hotkey: {} -> ctrl:{} shift:{} alt:{} key:{:?}",
+                         preview_config_hotkeys.breakpoint_hotkey, combo.0, combo.1, combo.2, combo.3);
                 combo
             } else {
                 (false, false, false, rdev::Key::Unknown(0))
@@ -997,6 +1037,24 @@ async fn main() -> Result<()> {
                             {
                                 eprintln!("Commit hotkey pressed");
                                 let _ = hotkey_commit_tx.send(());
+                            }
+
+                            // Preview mode: breakpoint hotkey
+                            if hotkey_preview_mode
+                                && CTRL == bp_ctrl
+                                && SHIFT == bp_shift
+                                && ALT == bp_alt
+                                && k == bp_key
+                            {
+                                eprintln!("Breakpoint hotkey pressed");
+                                if hotkey_breakpoint_flag
+                                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                                    .is_ok()
+                                {
+                                    let _ = hotkey_breakpoint_tx.send(());
+                                } else {
+                                    eprintln!("Breakpoint already in progress, ignoring");
+                                }
                             }
                         }
                         // Suppress unused warnings when preview-overlay is not enabled
@@ -1269,11 +1327,11 @@ async fn main() -> Result<()> {
                                         eprintln!("Preview overlay spawned");
                                         let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
                                         let info = format!(
-                                            "profile: {} | accuracy: {} ({}) | model: {}",
+                                            "profile: {} | correction: {} | accuracy: {} ({})",
                                             overlay_profile_label,
+                                            overlay_model_label,
                                             if accuracy_on { "on" } else { "off" },
                                             overlay_accuracy_model_label,
-                                            overlay_model_label,
                                         );
                                         let _ = handle.set_info(info);
                                         overlay_handle = Some(handle);
@@ -1301,11 +1359,86 @@ async fn main() -> Result<()> {
                         recv(checkpoint_rx) -> _ => {
                             #[cfg(feature = "preview-overlay")]
                             if let Some(ref handle) = overlay_handle {
-                                // Drain any duplicate checkpoint signals
-                                while checkpoint_rx.try_recv().is_ok() {}
-                                eprintln!("[CHECKPOINT] Processing...");
+                                if breakpoint_in_progress.load(Ordering::Relaxed) {
+                                    while checkpoint_rx.try_recv().is_ok() {}
+                                    eprintln!("[CHECKPOINT] Breakpoint in progress, skipping");
+                                } else {
+                                    // Drain any duplicate checkpoint signals
+                                    while checkpoint_rx.try_recv().is_ok() {}
+                                    eprintln!("[CHECKPOINT] Processing...");
 
-                                // Drain in-flight words from WebSocket before checkpointing
+                                    // Drain in-flight words from WebSocket before checkpointing
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    loop {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_millis(100),
+                                            read.next()
+                                        ).await {
+                                            Ok(Some(Ok(Message::Text(text)))) => {
+                                                if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                    if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                        let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                        if !word.is_empty() && has_alphanumeric {
+                                                            let _ = handle.send_word(word.to_string());
+                                                            #[cfg(feature = "llm-correct")]
+                                                            {
+                                                                correction_buffer.add_word(word);
+                                                                overlay_word_count += 1;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+
+                                    if let Err(e) = handle.checkpoint() {
+                                        eprintln!("[CHECKPOINT ERROR] {}", e);
+                                    }
+                                    // Reset correction state — checkpointed text is pasted, start fresh
+                                    // Must clear paragraph too, otherwise auto-commit re-pastes
+                                    // the checkpointed text from committed_sections
+                                    #[cfg(feature = "llm-correct")]
+                                    {
+                                        correction_buffer.take_paragraph();
+                                        overlay_word_count = 0;
+                                    }
+                                }
+                            }
+                        }
+                        // Preview mode: commit (paste all, close overlay, pause)
+                        recv(commit_rx) -> _ => {
+                            #[cfg(feature = "preview-overlay")]
+                            if let Some(ref handle) = overlay_handle {
+                                if breakpoint_in_progress.load(Ordering::Relaxed) {
+                                    while commit_rx.try_recv().is_ok() {}
+                                    eprintln!("[COMMIT] Breakpoint in progress, skipping");
+                                } else {
+                                    // Drain any duplicate commit signals
+                                    while commit_rx.try_recv().is_ok() {}
+                                    eprintln!("[COMMIT] Processing...");
+                                    if let Err(e) = handle.commit() {
+                                        eprintln!("[COMMIT ERROR] {}", e);
+                                    }
+                                    #[cfg(feature = "llm-correct")]
+                                    { overlay_word_count = 0; }
+                                    // Also pause capturing
+                                    *capturing.lock().unwrap() = false;
+                                    eprintln!("[COMMIT] Paused capturing");
+                                }
+                            }
+                        }
+                        // Preview mode: breakpoint (correct + checkpoint, continue)
+                        recv(breakpoint_rx) -> _ => {
+                            #[cfg(feature = "preview-overlay")]
+                            {
+                                if preview_mode {
+                                // Drain any duplicate breakpoint signals
+                                while breakpoint_rx.try_recv().is_ok() {}
+                                eprintln!("[BREAKPOINT] Processing...");
+
+                                // Drain in-flight words from WebSocket before snapshot
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 loop {
                                     match tokio::time::timeout(
@@ -1317,12 +1450,12 @@ async fn main() -> Result<()> {
                                                 if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
                                                     let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
                                                     if !word.is_empty() && has_alphanumeric {
-                                                        let _ = handle.send_word(word.to_string());
-                                                        #[cfg(feature = "llm-correct")]
-                                                        {
-                                                            correction_buffer.add_word(word);
-                                                            overlay_word_count += 1;
+                                                        last_word_time = Instant::now();
+                                                        if let Some(ref handle) = overlay_handle {
+                                                            let _ = handle.send_word(word.to_string());
                                                         }
+                                                        correction_buffer.add_word(word);
+                                                        overlay_word_count += 1;
                                                     }
                                                 }
                                             }
@@ -1331,34 +1464,296 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                if let Err(e) = handle.checkpoint() {
-                                    eprintln!("[CHECKPOINT ERROR] {}", e);
+                                let pre_breakpoint_word_count = overlay_word_count;
+                                overlay_word_count = 0;
+                                let mut final_text: Option<String> = None;
+
+                                if correction_buffer.paragraph_len() < 2 {
+                                    let (paragraph, _word_count, _char_count) = correction_buffer.take_paragraph();
+                                    if !paragraph.is_empty() || pre_breakpoint_word_count > 0 {
+                                        final_text = Some(paragraph);
+                                    }
+                                } else {
+                                    let (paragraph, _word_count, _char_count) = correction_buffer.take_paragraph();
+                                    correction_buffer.reset_chunk();
+
+                                    let accuracy_samples: Vec<f32> = {
+                                        let mut buf = accuracy_buffer.lock().unwrap();
+                                        buf.drain(..).collect()
+                                    };
+
+                                    if let Some(ref handle) = overlay_handle {
+                                        let _ = handle.breakpoint_start();
+                                    }
+                                    write_status("processing");
+
+                                    let profile: CorrectionProfile = args.correction_profile.into();
+                                    let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
+
+                                    let mut llm_candidate: Option<String> = None;
+                                    let mut llm_candidate_review: Option<String> = None;
+                                    let mut llm_candidate_safe = false;
+                                    let mut accuracy_candidate: Option<String> = None;
+                                    let mut accuracy_candidate_review: Option<String> = None;
+                                    let mut accuracy_candidate_safe = false;
+
+                                    let mut llm_result: Option<Result<String>> = None;
+                                    let mut accuracy_result: Option<Result<Option<String>>> = None;
+
+                                    if !breakpoint_review {
+                                        let mut correction_fut = tokio::time::timeout(
+                                            std::time::Duration::from_secs(15),
+                                            corrector.correct_paragraph(&paragraph),
+                                        );
+                                        tokio::pin!(correction_fut);
+                                        let mut accuracy_fut = if accuracy_on {
+                                            Some(Box::pin(tokio::time::timeout(
+                                                std::time::Duration::from_secs(15),
+                                                run_accuracy_pass_from_samples(accuracy_samples, &args),
+                                            )))
+                                        } else {
+                                            None
+                                        };
+                                        let mut llm_done = false;
+                                        let mut accuracy_done = !accuracy_on;
+
+                                        loop {
+                                            if llm_done && accuracy_done {
+                                                break;
+                                            }
+                                            tokio::select! {
+                                                result = &mut correction_fut, if !llm_done => {
+                                                    llm_done = true;
+                                                    match result {
+                                                        Ok(inner) => llm_result = Some(inner),
+                                                        Err(e) => eprintln!("[BREAKPOINT LLM TIMEOUT] {}", e),
+                                                    }
+                                                }
+                                                result = async {
+                                                    if let Some(fut) = &mut accuracy_fut {
+                                                        fut.as_mut().await
+                                                    } else {
+                                                        std::future::pending::<Result<Result<Option<String>>, tokio::time::error::Elapsed>>().await
+                                                    }
+                                                }, if !accuracy_done => {
+                                                    accuracy_done = true;
+                                                    match result {
+                                                        Ok(inner) => accuracy_result = Some(inner),
+                                                        Err(e) => eprintln!("[BREAKPOINT ACCURACY TIMEOUT] {}", e),
+                                                    }
+                                                }
+                                                msg = read.next() => {
+                                                    if let Some(Ok(Message::Text(text))) = msg {
+                                                        if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                                                            if let Some(word) = json.get("word").and_then(|v| v.as_str()) {
+                                                                let has_alphanumeric = word.chars().any(|c| c.is_alphanumeric());
+                                                                if !word.is_empty() && has_alphanumeric {
+                                                                    last_word_time = Instant::now();
+                                                                    if let Some(ref handle) = overlay_handle {
+                                                                        let _ = handle.send_word(word.to_string());
+                                                                    }
+                                                                    correction_buffer.add_word(word);
+                                                                    overlay_word_count += 1;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(15),
+                                            corrector.correct_paragraph(&paragraph),
+                                        )
+                                        .await
+                                        {
+                                            Ok(inner) => llm_result = Some(inner),
+                                            Err(e) => eprintln!("[BREAKPOINT LLM TIMEOUT] {}", e),
+                                        }
+
+                                        if accuracy_on {
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_secs(15),
+                                                run_accuracy_pass_from_samples(accuracy_samples, &args),
+                                            )
+                                            .await
+                                            {
+                                                Ok(inner) => accuracy_result = Some(inner),
+                                                Err(e) => eprintln!("[BREAKPOINT ACCURACY TIMEOUT] {}", e),
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(result) = llm_result {
+                                        match result {
+                                            Ok(corrected) if corrected != paragraph => {
+                                                let processed = postprocess_candidate(profile, &corrected);
+                                                if processed != paragraph {
+                                                    llm_candidate_review = Some(processed.clone());
+                                                }
+                                                if !is_safe_correction(&paragraph, &processed, profile) {
+                                                    eprintln!("[BREAKPOINT LLM SKIP] low similarity");
+                                                } else {
+                                                    eprintln!("[BREAKPOINT LLM CANDIDATE] '{}' -> '{}'", paragraph, processed);
+                                                    llm_candidate = Some(processed);
+                                                    llm_candidate_safe = true;
+                                                }
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => eprintln!("[BREAKPOINT LLM ERROR] {}", e),
+                                        }
+                                    }
+
+                                    if let Some(result) = accuracy_result {
+                                        match result {
+                                            Ok(Some(accuracy_text)) => {
+                                                let normalized = normalize_accuracy_text(&paragraph, &accuracy_text);
+                                                let processed = postprocess_candidate(profile, &normalized);
+                                                if processed != paragraph {
+                                                    accuracy_candidate_review = Some(processed.clone());
+                                                }
+                                                if processed != paragraph
+                                                    && is_safe_correction(&paragraph, &processed, profile)
+                                                {
+                                                    eprintln!("[BREAKPOINT ACCURACY CANDIDATE] '{}' -> '{}'", paragraph, processed);
+                                                    accuracy_candidate = Some(processed);
+                                                    accuracy_candidate_safe = true;
+                                                } else {
+                                                    eprintln!("[BREAKPOINT ACCURACY] No changes needed");
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => eprintln!("[BREAKPOINT ACCURACY ERROR] {}", e),
+                                        }
+                                    }
+
+                                    if breakpoint_review {
+                                        if let Some(ref handle) = overlay_handle {
+                                            let mut options: Vec<ReviewOption> = Vec::new();
+                                            options.push(ReviewOption {
+                                                choice: ReviewChoice::Raw,
+                                                text: paragraph.clone(),
+                                                safe: true,
+                                            });
+
+                                            let mut final_index: Option<usize> = None;
+                                            if let Some(ref text) = llm_candidate_review {
+                                                options.push(ReviewOption {
+                                                    choice: ReviewChoice::Final,
+                                                    text: text.clone(),
+                                                    safe: llm_candidate_safe,
+                                                });
+                                                final_index = Some(options.len() - 1);
+                                            }
+
+                                            let mut accuracy_index: Option<usize> = None;
+                                            if let Some(ref text) = accuracy_candidate_review {
+                                                options.push(ReviewOption {
+                                                    choice: ReviewChoice::Accuracy,
+                                                    text: text.clone(),
+                                                    safe: accuracy_candidate_safe,
+                                                });
+                                                accuracy_index = Some(options.len() - 1);
+                                            }
+
+                                            options.push(ReviewOption {
+                                                choice: ReviewChoice::Cancel,
+                                                text: "Cancel (do not paste)".to_string(),
+                                                safe: true,
+                                            });
+
+                                            let selected = if let Some(idx) = accuracy_index {
+                                                idx
+                                            } else if let Some(idx) = final_index {
+                                                idx
+                                            } else {
+                                                0
+                                            };
+                                            let _ = handle.show_review(options, selected);
+
+                                            let raw_for_log = paragraph.clone();
+                                            let llm_for_log = llm_candidate_review.clone();
+                                            let accuracy_for_log = accuracy_candidate_review.clone();
+                                            let model_for_log = overlay_model_label.clone();
+                                            loop {
+                                                if let Some(response) = handle.try_recv() {
+                                                    match response {
+                                                        OverlayResponse::ReviewSelection { choice, text, .. } => {
+                                                            log_review_decision(
+                                                                profile,
+                                                                accuracy_on,
+                                                                &model_for_log,
+                                                                &raw_for_log,
+                                                                llm_for_log.as_deref(),
+                                                                llm_candidate_safe,
+                                                                accuracy_for_log.as_deref(),
+                                                                accuracy_candidate_safe,
+                                                                choice,
+                                                                &text,
+                                                            );
+                                                            final_text = Some(text);
+                                                            break;
+                                                        }
+                                                        OverlayResponse::Cancel => {
+                                                            log_review_decision(
+                                                                profile,
+                                                                accuracy_on,
+                                                                &model_for_log,
+                                                                &raw_for_log,
+                                                                llm_for_log.as_deref(),
+                                                                llm_candidate_safe,
+                                                                accuracy_for_log.as_deref(),
+                                                                accuracy_candidate_safe,
+                                                                ReviewChoice::Cancel,
+                                                                "",
+                                                            );
+                                                            final_text = Some(paragraph.clone());
+                                                            break;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                            }
+                                        } else {
+                                            final_text = Some(paragraph.clone());
+                                        }
+                                    } else {
+                                        if let Some((chosen_text, source)) =
+                                            choose_best_correction(&paragraph, llm_candidate.clone(), accuracy_candidate.clone())
+                                        {
+                                            if chosen_text != paragraph {
+                                                eprintln!(
+                                                    "[BREAKPOINT APPLY] source={:?} '{}' -> '{}'",
+                                                    source,
+                                                    paragraph,
+                                                    chosen_text
+                                                );
+                                                final_text = Some(chosen_text);
+                                            }
+                                        }
+                                        if final_text.is_none() {
+                                            final_text = Some(paragraph.clone());
+                                        }
+                                    }
                                 }
-                                // Reset correction state — checkpointed text is pasted, start fresh
-                                // Must clear paragraph too, otherwise auto-commit re-pastes
-                                // the checkpointed text from committed_sections
-                                #[cfg(feature = "llm-correct")]
-                                {
-                                    correction_buffer.take_paragraph();
-                                    overlay_word_count = 0;
+
+                                if let Some(text) = final_text {
+                                    if let Some(ref handle) = overlay_handle {
+                                        if !text.is_empty() || pre_breakpoint_word_count > 0 {
+                                            let _ = handle.breakpoint_complete(text, pre_breakpoint_word_count);
+                                        }
+                                    }
                                 }
+                                if let Some(ref handle) = overlay_handle {
+                                    let _ = handle.set_status(OverlayStatus::Listening);
+                                }
+                                write_status("listening");
                             }
-                        }
-                        // Preview mode: commit (paste all, close overlay, pause)
-                        recv(commit_rx) -> _ => {
-                            #[cfg(feature = "preview-overlay")]
-                            if let Some(ref handle) = overlay_handle {
-                                // Drain any duplicate commit signals
-                                while commit_rx.try_recv().is_ok() {}
-                                eprintln!("[COMMIT] Processing...");
-                                if let Err(e) = handle.commit() {
-                                    eprintln!("[COMMIT ERROR] {}", e);
-                                }
-                                #[cfg(feature = "llm-correct")]
-                                { overlay_word_count = 0; }
-                                // Also pause capturing
-                                *capturing.lock().unwrap() = false;
-                                eprintln!("[COMMIT] Paused capturing");
+
+                                breakpoint_in_progress.store(false, Ordering::Release);
+                                last_word_time = Instant::now();
                             }
                         }
                         // Respawn overlay when toggle turns on and overlay is closed
@@ -1368,11 +1763,11 @@ async fn main() -> Result<()> {
                                 if let Some(ref handle) = overlay_handle {
                                     let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
                                     let info = format!(
-                                        "profile: {} | accuracy: {} ({}) | model: {}",
+                                        "profile: {} | correction: {} | accuracy: {} ({})",
                                         overlay_profile_label,
+                                        overlay_model_label,
                                         if accuracy_on { "on" } else { "off" },
                                         overlay_accuracy_model_label,
-                                        overlay_model_label,
                                     );
                                     let _ = handle.set_info(info);
                                     let _ = handle.set_status(OverlayStatus::Listening);
@@ -1384,11 +1779,11 @@ async fn main() -> Result<()> {
                                             eprintln!("Preview overlay respawned");
                                             let accuracy_on = should_run_accuracy(&args, accuracy_enabled.load(Ordering::Relaxed));
                                             let info = format!(
-                                                "profile: {} | accuracy: {} ({}) | model: {}",
+                                                "profile: {} | correction: {} | accuracy: {} ({})",
                                                 overlay_profile_label,
+                                                overlay_model_label,
                                                 if accuracy_on { "on" } else { "off" },
                                                 overlay_accuracy_model_label,
-                                                overlay_model_label,
                                             );
                                             let _ = handle.set_info(info);
                                             let _ = handle.set_status(OverlayStatus::Listening);
@@ -1428,11 +1823,11 @@ async fn main() -> Result<()> {
                             #[cfg(feature = "preview-overlay")]
                             if let Some(ref handle) = overlay_handle {
                                 let info = format!(
-                                    "profile: {} | accuracy: {} ({}) | model: {}",
+                                    "profile: {} | correction: {} | accuracy: {} ({})",
                                     overlay_profile_label,
+                                    overlay_model_label,
                                     if accuracy_on { "on" } else { "off" },
                                     overlay_accuracy_model_label,
-                                    overlay_model_label,
                                 );
                                 let _ = handle.set_info(info);
                             }
@@ -2795,16 +3190,7 @@ fn should_run_accuracy(args: &Args, accuracy_enabled: bool) -> bool {
 }
 
 #[cfg(feature = "llm-correct")]
-async fn run_accuracy_pass(
-    accuracy_buffer: &Arc<Mutex<VecDeque<f32>>>,
-    args: &Args,
-) -> Result<Option<String>> {
-    let samples: Vec<f32> = {
-        let mut buf = accuracy_buffer.lock().unwrap();
-        let samples: Vec<f32> = buf.iter().copied().collect();
-        buf.clear();
-        samples
-    };
+async fn run_accuracy_pass_from_samples(samples: Vec<f32>, args: &Args) -> Result<Option<String>> {
     if samples.is_empty() {
         return Ok(None);
     }
@@ -2841,6 +3227,20 @@ async fn run_accuracy_pass(
     }
 
     Ok(None)
+}
+
+#[cfg(feature = "llm-correct")]
+async fn run_accuracy_pass(
+    accuracy_buffer: &Arc<Mutex<VecDeque<f32>>>,
+    args: &Args,
+) -> Result<Option<String>> {
+    let samples: Vec<f32> = {
+        let mut buf = accuracy_buffer.lock().unwrap();
+        let samples: Vec<f32> = buf.iter().copied().collect();
+        buf.clear();
+        samples
+    };
+    run_accuracy_pass_from_samples(samples, args).await
 }
 
 #[cfg(feature = "llm-correct")]
@@ -2920,7 +3320,9 @@ fn parse_combo(s: &str) -> (bool, bool, bool, rdev::Key) {
             // Special keys
             "return" | "enter" => key = rdev::Key::Return,
             "kpadd" | "kp_add" | "numpadplus" => key = rdev::Key::KpPlus,
-            "kpminus" | "kp_minus" | "numpadminus" => key = rdev::Key::KpMinus,
+            "kpminus" | "kp_minus" | "kpsubtract" | "kp_subtract" | "numpadminus" | "numpadsubtract" => {
+                key = rdev::Key::KpMinus
+            }
             "kpenter" | "kp_enter" | "numpadenter" => key = rdev::Key::KpReturn,
             "space" => key = rdev::Key::Space,
             "tab" => key = rdev::Key::Tab,

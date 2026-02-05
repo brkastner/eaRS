@@ -114,6 +114,21 @@ impl PreviewBuffer {
         Some(text)
     }
 
+    /// Complete a breakpoint: push corrected text to committed, preserve post-breakpoint words.
+    /// `boundary` = number of active_words that existed when breakpoint fired.
+    /// Words added after the breakpoint (during correction) are preserved in active_words.
+    pub fn breakpoint_complete(&mut self, corrected: String, boundary: usize) -> Option<String> {
+        if corrected.is_empty() && boundary == 0 {
+            return None;
+        }
+        self.committed_sections.push(corrected.clone());
+        let actual_boundary = boundary.min(self.active_words.len());
+        self.active_words.drain(..actual_boundary);
+        self.corrected_active = None;
+        self.correction_pending = false;
+        Some(corrected)
+    }
+
     /// Commit: get all text (committed + active), clear everything
     pub fn commit(&mut self) -> Option<String> {
         let mut parts = Vec::new();
@@ -284,5 +299,52 @@ mod tests {
         buffer.apply_chunk_correction(1, 2, "cannot");
         assert_eq!(buffer.active_text(), "i cannot go");
         assert_eq!(buffer.active_word_count(), 3);
+    }
+
+    #[test]
+    fn test_breakpoint_complete_preserves_new_words() {
+        let mut buffer = PreviewBuffer::new();
+        for w in ["alpha", "beta", "gamma", "delta"] {
+            buffer.add_word(w.to_string());
+        }
+        // Simulate new words arriving during correction
+        buffer.add_word("epsilon".to_string());
+        buffer.add_word("zeta".to_string());
+
+        let result = buffer.breakpoint_complete("alpha beta gamma delta".to_string(), 4);
+        assert_eq!(result, Some("alpha beta gamma delta".to_string()));
+        assert_eq!(buffer.active_text(), "epsilon zeta");
+        assert_eq!(buffer.committed_sections.len(), 1);
+    }
+
+    #[test]
+    fn test_breakpoint_complete_empty_buffer() {
+        let mut buffer = PreviewBuffer::new();
+        let result = buffer.breakpoint_complete(String::new(), 0);
+        assert_eq!(result, None);
+        assert!(buffer.active_words.is_empty());
+        assert!(buffer.committed_sections.is_empty());
+    }
+
+    #[test]
+    fn test_breakpoint_complete_boundary_exceeds_len() {
+        let mut buffer = PreviewBuffer::new();
+        buffer.add_word("one".to_string());
+        buffer.add_word("two".to_string());
+        let result = buffer.breakpoint_complete("one two".to_string(), 5);
+        assert_eq!(result, Some("one two".to_string()));
+        assert!(buffer.active_words.is_empty());
+        assert_eq!(buffer.committed_sections.len(), 1);
+    }
+
+    #[test]
+    fn test_breakpoint_complete_zero_boundary() {
+        let mut buffer = PreviewBuffer::new();
+        buffer.add_word("keep".to_string());
+        buffer.add_word("these".to_string());
+        let result = buffer.breakpoint_complete("committed".to_string(), 0);
+        assert_eq!(result, Some("committed".to_string()));
+        assert_eq!(buffer.active_text(), "keep these");
+        assert_eq!(buffer.committed_sections.len(), 1);
     }
 }
